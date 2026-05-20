@@ -47,6 +47,7 @@ export function Hero() {
             <Button
               size="lg"
               className="h-12 px-6 text-base font-medium"
+              nativeButton={false}
               render={<Link href="/design/new" />}
             >
               Open editor
@@ -56,6 +57,7 @@ export function Hero() {
               size="lg"
               variant="ghost"
               className="h-12 px-6 text-base font-medium"
+              nativeButton={false}
               render={<Link href="#features" />}
             >
               <Boxes className="mr-1 size-4" />

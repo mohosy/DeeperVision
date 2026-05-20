@@ -26,6 +26,7 @@ export function TopNav() {
           <Button
             size="sm"
             className="ml-2"
+            nativeButton={false}
             render={<Link href="/design/new" />}
           >
             Start designing

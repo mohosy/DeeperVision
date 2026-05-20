@@ -2,6 +2,7 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { temporal } from "zundo";
 import type {
   DesignDocument,
   Device,
@@ -52,12 +53,22 @@ export function createDefaultDesign(id?: string): DesignDocument {
   };
 }
 
+export type Tool = "select" | "wall" | "calibrate";
+
+export interface ViewTransform {
+  scale: number;
+  offset: Vec2;
+}
+
 interface DesignState {
   designs: Record<string, DesignDocument>;
   currentDesignId: string | null;
   viewMode: ViewMode;
   threeDMode: ThreeDMode;
   selectedDeviceId: string | null;
+  tool: Tool;
+  showCoverage: boolean;
+  viewTransform: ViewTransform;
 
   ensureDesign(id: string): DesignDocument;
   setCurrentDesign(id: string): void;
@@ -66,6 +77,9 @@ interface DesignState {
   setViewMode(mode: ViewMode): void;
   setThreeDMode(mode: ThreeDMode): void;
   selectDevice(deviceId: string | null): void;
+  setTool(tool: Tool): void;
+  toggleCoverage(): void;
+  setViewTransform(t: ViewTransform): void;
 
   addFloor(): void;
   setActiveFloor(floorId: string): void;
@@ -94,257 +108,282 @@ function defaultsFor(type: DeviceType): Omit<Device, "id" | "position"> {
 
 export const useDesignStore = create<DesignState>()(
   persist(
-    (set, get) => ({
-      designs: {},
-      currentDesignId: null,
-      viewMode: "2d",
-      threeDMode: "orbit",
-      selectedDeviceId: null,
+    temporal(
+      (set, get) => ({
+        designs: {},
+        currentDesignId: null,
+        viewMode: "2d",
+        threeDMode: "orbit",
+        selectedDeviceId: null,
+        tool: "select",
+        showCoverage: true,
+        viewTransform: { scale: 1, offset: { x: 0, y: 0 } },
 
-      ensureDesign(id: string) {
-        const existing = get().designs[id];
-        if (existing) return existing;
-        const fresh = createDefaultDesign(id);
-        set((state) => ({
-          designs: { ...state.designs, [id]: fresh },
-          currentDesignId: id,
-        }));
-        return fresh;
-      },
+        ensureDesign(id) {
+          const existing = get().designs[id];
+          if (existing) return existing;
+          const fresh = createDefaultDesign(id);
+          set((state) => ({
+            designs: { ...state.designs, [id]: fresh },
+            currentDesignId: id,
+          }));
+          return fresh;
+        },
 
-      setCurrentDesign(id: string) {
-        set({ currentDesignId: id });
-      },
+        setCurrentDesign(id) {
+          set({ currentDesignId: id });
+        },
 
-      updateDesignName(id, name) {
-        set((state) => {
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: { ...design, name, updatedAt: nowISO() },
-            },
-          };
-        });
-      },
-
-      setViewMode(mode) {
-        set({ viewMode: mode });
-      },
-
-      setThreeDMode(mode) {
-        set({ threeDMode: mode });
-      },
-
-      selectDevice(deviceId) {
-        set({ selectedDeviceId: deviceId });
-      },
-
-      addFloor() {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          const newFloor: Floor = {
-            ...createDefaultFloor(),
-            name: `Level ${design.floors.length}`,
-            index: design.floors.length,
-          };
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: [...design.floors, newFloor],
-                activeFloorId: newFloor.id,
-                updatedAt: nowISO(),
+        updateDesignName(id, name) {
+          set((state) => {
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: { ...design, name, updatedAt: nowISO() },
               },
-            },
-          };
-        });
-      },
+            };
+          });
+        },
 
-      setActiveFloor(floorId) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: { ...design, activeFloorId: floorId },
-            },
-          };
-        });
-      },
+        setViewMode(mode) {
+          set({ viewMode: mode });
+        },
 
-      updateFloor(floorId, partial) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId ? { ...f, ...partial } : f
-                ),
-                updatedAt: nowISO(),
+        setThreeDMode(mode) {
+          set({ threeDMode: mode });
+        },
+
+        selectDevice(deviceId) {
+          set({ selectedDeviceId: deviceId });
+        },
+
+        setTool(tool) {
+          set({ tool });
+        },
+
+        toggleCoverage() {
+          set((state) => ({ showCoverage: !state.showCoverage }));
+        },
+
+        setViewTransform(t) {
+          set({ viewTransform: t });
+        },
+
+        addFloor() {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            const newFloor: Floor = {
+              ...createDefaultFloor(),
+              name: `Level ${design.floors.length}`,
+              index: design.floors.length,
+            };
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: [...design.floors, newFloor],
+                  activeFloorId: newFloor.id,
+                  updatedAt: nowISO(),
+                },
               },
-            },
-          };
-        });
-      },
+            };
+          });
+        },
 
-      addDevice(floorId, type, position) {
-        const newDevice: Device = {
-          ...defaultsFor(type),
-          id: uid("dev"),
-          position,
-        } as Device;
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId
-                    ? { ...f, devices: [...f.devices, newDevice] }
-                    : f
-                ),
-                updatedAt: nowISO(),
+        setActiveFloor(floorId) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: { ...design, activeFloorId: floorId },
               },
-            },
-            selectedDeviceId: newDevice.id,
-          };
-        });
-        return newDevice;
-      },
+            };
+          });
+        },
 
-      updateDevice(floorId, deviceId, partial) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId
-                    ? {
-                        ...f,
-                        devices: f.devices.map((d) =>
-                          d.id === deviceId
-                            ? ({ ...d, ...partial } as Device)
-                            : d
-                        ),
-                      }
-                    : f
-                ),
-                updatedAt: nowISO(),
+        updateFloor(floorId, partial) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId ? { ...f, ...partial } : f
+                  ),
+                  updatedAt: nowISO(),
+                },
               },
-            },
-          };
-        });
-      },
+            };
+          });
+        },
 
-      removeDevice(floorId, deviceId) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId
-                    ? {
-                        ...f,
-                        devices: f.devices.filter((d) => d.id !== deviceId),
-                      }
-                    : f
-                ),
-                updatedAt: nowISO(),
+        addDevice(floorId, type, position) {
+          const newDevice: Device = {
+            ...defaultsFor(type),
+            id: uid("dev"),
+            position,
+          } as Device;
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? { ...f, devices: [...f.devices, newDevice] }
+                      : f
+                  ),
+                  updatedAt: nowISO(),
+                },
               },
-            },
-            selectedDeviceId:
-              state.selectedDeviceId === deviceId
-                ? null
-                : state.selectedDeviceId,
-          };
-        });
-      },
+              selectedDeviceId: newDevice.id,
+            };
+          });
+          return newDevice;
+        },
 
-      addWall(floorId, wall) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          const newWall: Wall = { ...wall, id: uid("wall") };
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId ? { ...f, walls: [...f.walls, newWall] } : f
-                ),
-                updatedAt: nowISO(),
+        updateDevice(floorId, deviceId, partial) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          devices: f.devices.map((d) =>
+                            d.id === deviceId
+                              ? ({ ...d, ...partial } as Device)
+                              : d
+                          ),
+                        }
+                      : f
+                  ),
+                  updatedAt: nowISO(),
+                },
               },
-            },
-          };
-        });
-      },
+            };
+          });
+        },
 
-      removeWall(floorId, wallId) {
-        set((state) => {
-          const id = state.currentDesignId;
-          if (!id) return state;
-          const design = state.designs[id];
-          if (!design) return state;
-          return {
-            designs: {
-              ...state.designs,
-              [id]: {
-                ...design,
-                floors: design.floors.map((f) =>
-                  f.id === floorId
-                    ? { ...f, walls: f.walls.filter((w) => w.id !== wallId) }
-                    : f
-                ),
-                updatedAt: nowISO(),
+        removeDevice(floorId, deviceId) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          devices: f.devices.filter((d) => d.id !== deviceId),
+                        }
+                      : f
+                  ),
+                  updatedAt: nowISO(),
+                },
               },
-            },
-          };
-        });
-      },
-    }),
+              selectedDeviceId:
+                state.selectedDeviceId === deviceId
+                  ? null
+                  : state.selectedDeviceId,
+            };
+          });
+        },
+
+        addWall(floorId, wall) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            const newWall: Wall = { ...wall, id: uid("wall") };
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? { ...f, walls: [...f.walls, newWall] }
+                      : f
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        removeWall(floorId, wallId) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? { ...f, walls: f.walls.filter((w) => w.id !== wallId) }
+                      : f
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+      }),
+      {
+        limit: 50,
+        partialize: (state) => ({ designs: state.designs }),
+        equality: (a, b) => a.designs === b.designs,
+      }
+    ),
     {
       name: "deeper-vision-store",
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         designs: state.designs,
         currentDesignId: state.currentDesignId,
         viewMode: state.viewMode,
         threeDMode: state.threeDMode,
+        showCoverage: state.showCoverage,
       }),
     }
   )

@@ -8,7 +8,7 @@ import { LibraryPanel } from "./LibraryPanel";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { StatusBar } from "./StatusBar";
 import { Canvas2D } from "@/components/canvas2d/Canvas2D";
-import { Scene3DPlaceholder } from "@/components/scene3d/Scene3DPlaceholder";
+import { Scene3D } from "@/components/scene3d/Scene3D";
 import { SimulationPlaceholder } from "@/components/simulation/SimulationPlaceholder";
 
 function useHasHydrated() {
@@ -53,7 +53,7 @@ export function EditorShell({ designId }: { designId: string }) {
               className="absolute inset-0"
             >
               {mode === "2d" && <Canvas2D />}
-              {mode === "3d" && <Scene3DPlaceholder />}
+              {mode === "3d" && <Scene3D />}
               {mode === "sim" && <SimulationPlaceholder />}
             </motion.div>
           </AnimatePresence>
