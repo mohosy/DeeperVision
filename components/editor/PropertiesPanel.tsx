@@ -30,11 +30,22 @@ export function PropertiesPanel() {
     floor?.devices.find((d) => d.id === selectedId) ?? null;
 
   return (
-    <aside className="flex h-full w-full flex-col border-l border-border bg-sidebar">
-      <div className="border-b border-border p-3">
-        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+    <aside className="flex h-full w-full flex-col border-l border-border/70 bg-sidebar">
+      <div className="border-b border-border/70 px-4 py-3">
+        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
           {selected ? "Device properties" : floor ? "Floor settings" : "Properties"}
         </div>
+        {selected && (
+          <div className="mt-1 text-[0.78rem] font-serif-italic text-foreground/70">
+            Editing {selected.type === "camera"
+              ? "a camera"
+              : selected.type === "reader"
+                ? "a reader"
+                : selected.type === "sensor"
+                  ? "a sensor"
+                  : "a network device"}
+          </div>
+        )}
       </div>
       <ScrollArea className="flex-1">
         <div className="p-4 space-y-5">

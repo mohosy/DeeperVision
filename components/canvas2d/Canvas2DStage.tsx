@@ -253,7 +253,16 @@ export function Canvas2DStage({
       }}
     >
       {!planImage && floor.devices.length === 0 && floor.walls.length === 0 && (
-        <FloorPlanEmptyState onClick={onRequestUpload} />
+        <FloorPlanEmptyState
+          onUpload={onRequestUpload}
+          onLoadDemo={() => {
+            useDesignStore.getState().loadDemo();
+            toast.success("Demo office loaded", {
+              description:
+                "Twelve walls, ten devices. Flip to 3D to see the building extrude.",
+            });
+          }}
+        />
       )}
 
       <Stage
@@ -375,21 +384,23 @@ export function Canvas2DStage({
   );
 }
 
-function FloorPlanEmptyState({ onClick }: { onClick: () => void }) {
+function FloorPlanEmptyState({
+  onUpload,
+  onLoadDemo,
+}: {
+  onUpload: () => void;
+  onLoadDemo: () => void;
+}) {
   return (
     <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-      <button
-        type="button"
-        onClick={onClick}
-        className="pointer-events-auto group flex flex-col items-center gap-4 rounded-2xl border-2 border-dashed border-border bg-card/40 px-10 py-12 text-center transition-all hover:border-primary/50 hover:bg-card/60"
-      >
-        <div className="flex size-14 items-center justify-center rounded-xl border border-border bg-background/40 transition-colors group-hover:border-primary/40">
+      <div className="pointer-events-auto flex max-w-md flex-col items-center gap-5 rounded-2xl border border-dashed border-border surface-card px-10 py-12 text-center">
+        <div className="flex size-14 items-center justify-center rounded-xl border border-border bg-background/40 shadow-[inset_0_1px_0_oklch(1_0_0/5%)]">
           <svg
             xmlns="http://www.w3.org/2000/svg"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
-            strokeWidth={2}
+            strokeWidth={1.6}
             strokeLinecap="round"
             strokeLinejoin="round"
             className="size-6 text-primary"
@@ -399,14 +410,37 @@ function FloorPlanEmptyState({ onClick }: { onClick: () => void }) {
             <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
           </svg>
         </div>
-        <div className="space-y-1.5">
-          <div className="text-base font-semibold">Upload a floor plan</div>
-          <div className="text-sm text-muted-foreground max-w-xs">
-            Drop a JPG or PNG to begin. Or drag a device from the sidebar to
-            start designing without a plan.
+        <div className="space-y-2">
+          <div className="text-lg font-medium tracking-[-0.01em]">
+            Start with a{" "}
+            <span className="font-serif-italic text-primary">
+              sample office
+            </span>
+            , or upload your own.
+          </div>
+          <div className="text-sm text-muted-foreground leading-relaxed max-w-sm">
+            The demo ships with a floor plan, traced walls, and ten devices —
+            cameras, readers, sensors, network. Flip to 3D to see the rooms
+            extrude.
           </div>
         </div>
-      </button>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={onLoadDemo}
+            className="inline-flex h-10 items-center gap-1.5 rounded-lg bg-primary px-4 text-[0.92rem] font-medium text-primary-foreground btn-lift shadow-[inset_0_1px_0_oklch(1_0_0/14%),0_6px_18px_-8px_oklch(0.78_0.135_158/55%)] hover:bg-primary/90"
+          >
+            Load demo office
+          </button>
+          <button
+            type="button"
+            onClick={onUpload}
+            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-border bg-card/40 px-4 text-[0.92rem] font-medium text-foreground btn-lift hover:bg-card/70"
+          >
+            Upload my own plan
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -160,9 +160,9 @@ export function LibraryPanel() {
   }
 
   return (
-    <aside className="flex flex-col h-full border-r border-border bg-sidebar">
-      <div className="border-b border-border p-3">
-        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+    <aside className="flex flex-col h-full border-r border-border/70 bg-sidebar">
+      <div className="border-b border-border/70 px-3 py-3">
+        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-muted-foreground mb-2">
           Device library
         </div>
         <div className="relative">
@@ -184,7 +184,7 @@ export function LibraryPanel() {
           )}
           {filtered.map((group) => (
             <div key={group.category}>
-              <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+              <div className="text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-muted-foreground mb-2">
                 {group.category}
               </div>
               <div className="space-y-1.5">

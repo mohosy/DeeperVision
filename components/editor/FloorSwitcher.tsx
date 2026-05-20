@@ -21,7 +21,7 @@ export function FloorSwitcher() {
             type="button"
             onClick={() => setActive(floor.id)}
             className={cn(
-              "shrink-0 rounded-md px-3 py-1 text-xs font-medium transition-colors",
+              "shrink-0 rounded-md px-2.5 py-1 text-[0.75rem] font-medium tracking-[-0.005em] transition-colors",
               active
                 ? "bg-primary/15 text-primary border border-primary/40"
                 : "border border-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -34,7 +34,7 @@ export function FloorSwitcher() {
       <button
         type="button"
         onClick={() => addFloor()}
-        className="ml-1 inline-flex items-center gap-1 rounded-md border border-dashed border-border px-2 py-1 text-xs font-medium text-muted-foreground hover:text-foreground hover:border-primary/40"
+        className="ml-1 inline-flex items-center gap-1 rounded-md border border-dashed border-border/70 px-2 py-1 text-[0.72rem] font-medium text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
       >
         <Plus className="size-3" />
         Add floor

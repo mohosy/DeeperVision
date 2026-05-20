@@ -19,6 +19,7 @@ import {
   READER_DEFAULTS,
   SENSOR_DEFAULTS,
 } from "@/types/design";
+import { buildDemoFloor } from "./demo-design";
 
 function uid(prefix = "id"): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
@@ -91,6 +92,8 @@ interface DesignState {
 
   addWall(floorId: string, wall: Omit<Wall, "id">): void;
   removeWall(floorId: string, wallId: string): void;
+
+  loadDemo(): void;
 }
 
 function defaultsFor(type: DeviceType): Omit<Device, "id" | "position"> {
@@ -365,6 +368,35 @@ export const useDesignStore = create<DesignState>()(
                   updatedAt: nowISO(),
                 },
               },
+            };
+          });
+        },
+
+        loadDemo() {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            const demoFloor: Floor = {
+              ...buildDemoFloor(),
+              id: uid("floor"),
+              index: 0,
+            };
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  name: "Demo office",
+                  floors: [demoFloor],
+                  activeFloorId: demoFloor.id,
+                  updatedAt: nowISO(),
+                },
+              },
+              selectedDeviceId: null,
+              viewMode: "2d",
+              viewTransform: { scale: 1, offset: { x: 0, y: 0 } },
             };
           });
         },
