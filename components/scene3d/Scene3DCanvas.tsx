@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import {
   AdaptiveDpr,
@@ -11,6 +11,7 @@ import {
   RoundedBox,
 } from "@react-three/drei";
 import * as THREE from "three";
+import { useTheme } from "next-themes";
 import { useActiveFloor, useDesignStore } from "@/lib/store";
 import { useSimStore } from "@/lib/sim-store";
 import type { Device, Floor, Wall } from "@/types/design";
@@ -40,6 +41,17 @@ export function Scene3DCanvas({
   const showCoverage = useDesignStore((s) => s.showCoverage);
   const threeDMode = useDesignStore((s) => s.threeDMode);
   const setThreeDMode = useDesignStore((s) => s.setThreeDMode);
+  const { resolvedTheme } = useTheme();
+  const [mountedTheme, setMountedTheme] = useState<"light" | "dark">("dark");
+  useEffect(() => {
+    setMountedTheme(resolvedTheme === "light" ? "light" : "dark");
+  }, [resolvedTheme]);
+  const isLight = mountedTheme === "light";
+  const bgColor = isLight ? "#eef0f3" : "#0c0c0d";
+  const floorColor = isLight ? "#dcdee2" : "#1a1a1d";
+  const wallColor = isLight ? "#cbd0d6" : "#27272a";
+  const gridCell = isLight ? "#cbd5e1" : "#1f2937";
+  const gridSection = isLight ? "#94a3b8" : "#374151";
 
   const frame = useMemo(() => floor && computeFrame(floor), [floor]);
 
@@ -90,11 +102,8 @@ export function Scene3DCanvas({
         gl={{ antialias: true }}
       >
         <AdaptiveDpr pixelated={false} />
-        <color attach="background" args={["#0c0c0d"]} />
-        <fog
-          attach="fog"
-          args={["#0c0c0d", maxDim * 1.8, maxDim * 4]}
-        />
+        <color attach="background" args={[bgColor]} />
+        <fog attach="fog" args={[bgColor, maxDim * 1.8, maxDim * 4]} />
 
         <ambientLight intensity={0.6} />
         <directionalLight
@@ -121,8 +130,8 @@ export function Scene3DCanvas({
         <Grid
           position={[center.x, 0.01, center.z]}
           args={[maxDim * 3, maxDim * 3]}
-          cellColor="#1f2937"
-          sectionColor="#374151"
+          cellColor={gridCell}
+          sectionColor={gridSection}
           cellSize={1}
           sectionSize={5}
           fadeDistance={maxDim * 2.5}
@@ -137,13 +146,13 @@ export function Scene3DCanvas({
           position={[center.x, 0, center.z]}
         >
           <planeGeometry args={[span.x * 1.1, span.z * 1.1]} />
-          <meshStandardMaterial color="#1a1a1d" roughness={0.85} metalness={0} />
+          <meshStandardMaterial color={floorColor} roughness={0.85} metalness={0} />
         </mesh>
 
         {/* Soft contact shadows under everything */}
         <ContactShadows
           position={[center.x, 0.005, center.z]}
-          opacity={0.42}
+          opacity={isLight ? 0.28 : 0.42}
           scale={Math.max(span.x, span.z) * 1.4}
           blur={2.6}
           far={6}
@@ -158,6 +167,7 @@ export function Scene3DCanvas({
             wall={wall}
             scale={floor.scale}
             ceilingHeight={floor.ceilingHeight}
+            color={wallColor}
           />
         ))}
 
@@ -293,10 +303,12 @@ function Wall3D({
   wall,
   scale,
   ceilingHeight,
+  color = "#27272a",
 }: {
   wall: Wall;
   scale: number;
   ceilingHeight: number;
+  color?: string;
 }) {
   // Convert from floor-plan pixels to world meters. The plan's +Y in pixel
   // space maps to world +Z so the design's top-down view still reads
@@ -319,7 +331,7 @@ function Wall3D({
       rotation={[0, -angle, 0]}
     >
       <boxGeometry args={[length, ceilingHeight, wallThickness]} />
-      <meshStandardMaterial color="#27272a" roughness={0.7} />
+      <meshStandardMaterial color={color} roughness={0.7} />
     </mesh>
   );
 }

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Eye } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export function TopNav() {
   return (
@@ -27,9 +28,10 @@ export function TopNav() {
           >
             Editor
           </Link>
+          <ThemeToggle size="sm" className="ml-1" />
           <Button
             size="sm"
-            className="ml-2 btn-lift shadow-[0_4px_18px_-8px_oklch(0.78_0.135_158/55%)]"
+            className="ml-1 btn-lift shadow-[0_4px_18px_-8px_oklch(0.78_0.135_158/55%)]"
             nativeButton={false}
             render={<Link href="/design/new" />}
           >

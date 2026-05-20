@@ -244,7 +244,7 @@ export function Canvas2DStage({
   return (
     <div
       ref={containerRef}
-      className="relative h-full w-full bg-[oklch(0.115_0_0)] bg-grid"
+      className="relative h-full w-full bg-canvas bg-grid"
       style={{ cursor: cursorStyle }}
       onDrop={onContainerDrop}
       onDragOver={(e) => {

@@ -207,18 +207,18 @@ function DetectionFeed() {
 
 function NoPathState() {
   return (
-    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-[oklch(0.115_0_0)]">
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-canvas">
       <div
         className="absolute inset-0 pointer-events-none"
         style={{
           background:
-            "radial-gradient(50% 60% at 50% 50%, oklch(0.65 0.22 25 / 12%), transparent 70%)",
+            "radial-gradient(50% 60% at 50% 50%, var(--canvas-accent), transparent 70%)",
         }}
       />
       <div className="absolute inset-0 bg-grid-fine pointer-events-none opacity-30" />
       <div className="relative max-w-md text-center px-8">
         <div className="inline-flex items-center justify-center rounded-2xl border border-border bg-card/60 p-4 backdrop-blur">
-          <AlertTriangle className="size-7 text-rose-400" />
+          <AlertTriangle className="size-7 text-primary" />
         </div>
         <h3 className="mt-5 text-2xl font-medium tracking-[-0.01em]">
           No simulation path on this floor
@@ -226,9 +226,10 @@ function NoPathState() {
         <p className="mt-3 text-sm text-muted-foreground leading-relaxed">
           Load the{" "}
           <span className="font-serif-italic text-foreground/80">demo office</span>{" "}
-          (Switch to 2D and press &ldquo;Load demo office&rdquo;) to see a threat
-          actor walk a preset path through the building with cameras detecting
-          them in real time. Custom path drawing comes in the next milestone.
+          (Switch to 2D and press &ldquo;Load demo office&rdquo;) to see a
+          subject walk a preset path through the building with cameras picking
+          them up in real time. Custom path drawing comes in the next
+          milestone.
         </p>
       </div>
     </div>

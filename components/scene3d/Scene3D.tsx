@@ -38,7 +38,7 @@ export function Scene3D({ showSim = false }: { showSim?: boolean } = {}) {
   return (
     <div
       ref={containerRef}
-      className="relative h-full w-full overflow-hidden bg-[oklch(0.115_0_0)]"
+      className="relative h-full w-full overflow-hidden bg-canvas"
     >
       {size.width > 0 && size.height > 0 && !isEmpty && (
         <Scene3DCanvas

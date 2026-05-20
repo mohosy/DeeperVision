@@ -5,6 +5,7 @@ import { Download, Eye, Save } from "lucide-react";
 import { useDesignStore, useCurrentDesign } from "@/lib/store";
 import { Button } from "@/components/ui/button";
 import { ModeSwitcher } from "./ModeSwitcher";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { toast } from "sonner";
 
 export function TopBar() {
@@ -38,6 +39,7 @@ export function TopBar() {
       <ModeSwitcher />
 
       <div className="flex flex-1 items-center justify-end gap-1.5">
+        <ThemeToggle size="sm" className="mr-1" />
         <Button
           size="sm"
           variant="ghost"

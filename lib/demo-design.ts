@@ -187,9 +187,9 @@ function demoDevices(): Array<
 }
 
 /**
- * A walking path that enters at the south door, crosses the open office,
- * cuts up through the conference area, and ends in the server room.
- * Floor-plan pixel coords.
+ * A walking path the simulation subject follows: enters at the south door,
+ * crosses the open office, cuts up through the conference area, and ends in
+ * the server room. Floor-plan pixel coords.
  */
 function demoSimPath() {
   return [
