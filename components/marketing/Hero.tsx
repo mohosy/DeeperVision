@@ -24,12 +24,22 @@ export function Hero() {
           aria-hidden="true"
           className="absolute inset-0 size-full object-cover"
         />
-        {/* Very soft top-vignette so the headline reads against bright sky */}
+        {/* Stronger contrast wash so the headline always reads against the
+           bright sky, then fades out by mid-image */}
         <div
           className="absolute inset-0"
           style={{
             background:
-              "linear-gradient(180deg, rgba(0, 70, 140, 0.18) 0%, rgba(0,0,0,0) 35%)",
+              "linear-gradient(180deg, rgba(0, 60, 130, 0.42) 0%, rgba(0, 60, 130, 0.18) 25%, rgba(0,0,0,0) 55%)",
+          }}
+        />
+        {/* Centered halo behind the title to lift it off the sky a touch
+           more without darkening the whole image */}
+        <div
+          className="pointer-events-none absolute left-1/2 top-[42%] -z-0 size-[680px] -translate-x-1/2 -translate-y-1/2 rounded-full blur-3xl"
+          style={{
+            background:
+              "radial-gradient(closest-side, rgba(0, 30, 80, 0.22), rgba(0,0,0,0) 70%)",
           }}
         />
         {/* Bottom fade into the dark section that follows */}
@@ -88,8 +98,12 @@ export function Hero() {
           className="max-w-4xl text-center"
         >
           <h1
-            className="font-serif text-white text-[3.2rem] leading-[1.04] tracking-[-0.015em] drop-shadow-[0_4px_24px_rgba(0,30,80,0.18)] sm:text-[5rem] md:text-[5.75rem]"
-            style={{ fontStyle: "normal" }}
+            className="font-serif text-white text-[3.2rem] leading-[1.04] tracking-[-0.015em] sm:text-[5rem] md:text-[5.75rem]"
+            style={{
+              fontStyle: "normal",
+              textShadow:
+                "0 1px 2px rgba(0,20,60,0.45), 0 8px 32px rgba(0,20,60,0.35), 0 2px 8px rgba(0,20,60,0.55)",
+            }}
           >
             Design security systems
             <br />
@@ -98,7 +112,13 @@ export function Hero() {
             experience them.
           </h1>
 
-          <p className="mx-auto mt-8 max-w-xl text-[0.98rem] leading-[1.55] text-white/85 drop-shadow-[0_1px_3px_rgba(0,30,80,0.12)] sm:text-[1.05rem]">
+          <p
+            className="mx-auto mt-8 max-w-xl text-[0.98rem] leading-[1.55] text-white sm:text-[1.05rem]"
+            style={{
+              textShadow:
+                "0 1px 2px rgba(0,20,60,0.5), 0 2px 10px rgba(0,20,60,0.4)",
+            }}
+          >
             Deeper Vision is the first site-survey platform where every
             camera, every wall, and every blind spot is a real 3D object you
             can walk through, drag around, and price for your customer before
