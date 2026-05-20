@@ -274,24 +274,31 @@ export function DevicePreview3DCanvas({ kind }: { kind: PreviewKind }) {
   const bg = BACKGROUND_TINTS[device.type];
   const layout = LAYOUTS[kind.subtype];
 
+  // Wrap in an absolute-inset div so R3F's internal canvas always knows it
+  // has 100% of the parent's size to fill. Without this wrapper the small
+  // 56×56 container can fail to trigger R3F's ResizeObserver in time and the
+  // canvas defaults to 300×150 — at which point our scene renders correctly
+  // but at the wrong scale and gets cropped to almost nothing visible.
   return (
-    <Canvas
-      dpr={[1, 1.8]}
-      camera={{ position: layout.cameraPos, fov: layout.fov, near: 0.1, far: 10 }}
-      gl={{ antialias: true }}
-      onCreated={({ camera, gl }) => {
-        gl.toneMapping = THREE.ACESFilmicToneMapping;
-        gl.toneMappingExposure = 1.25;
-        gl.outputColorSpace = THREE.SRGBColorSpace;
-        camera.lookAt(
-          layout.lookAt[0],
-          layout.lookAt[1],
-          layout.lookAt[2]
-        );
-        camera.updateMatrixWorld(true);
-      }}
-      style={{ pointerEvents: "none", width: "100%", height: "100%" }}
-    >
+    <div style={{ position: "absolute", inset: 0 }}>
+      <Canvas
+        dpr={[1, 1.8]}
+        camera={{
+          position: layout.cameraPos,
+          fov: layout.fov,
+          near: 0.1,
+          far: 10,
+        }}
+        gl={{ antialias: true }}
+        onCreated={({ camera, gl }) => {
+          gl.toneMapping = THREE.ACESFilmicToneMapping;
+          gl.toneMappingExposure = 1.25;
+          gl.outputColorSpace = THREE.SRGBColorSpace;
+          camera.lookAt(layout.lookAt[0], layout.lookAt[1], layout.lookAt[2]);
+          camera.updateMatrixWorld(true);
+        }}
+        style={{ pointerEvents: "none" }}
+      >
       <color attach="background" args={[bg]} />
 
       {/* Studio-grade lighting: strong ambient + warm key + cool fill +
@@ -316,17 +323,18 @@ export function DevicePreview3DCanvas({ kind }: { kind: PreviewKind }) {
       />
       <hemisphereLight args={["#ffffff", "#d4d4d8", 0.45]} />
 
-      <Rotator initialYaw={layout.initialYaw} speed={0.28}>
-        <group scale={layout.scale}>
-          <LightenHousings>
-            <DeviceMesh
-              device={device}
-              accent={accent}
-              emissiveIntensity={1.25}
-            />
-          </LightenHousings>
-        </group>
-      </Rotator>
-    </Canvas>
+        <Rotator initialYaw={layout.initialYaw} speed={0.28}>
+          <group scale={layout.scale}>
+            <LightenHousings>
+              <DeviceMesh
+                device={device}
+                accent={accent}
+                emissiveIntensity={1.25}
+              />
+            </LightenHousings>
+          </group>
+        </Rotator>
+      </Canvas>
+    </div>
   );
 }
