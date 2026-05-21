@@ -496,6 +496,13 @@ When the user gives a DIRECTIVE ("add a camera at the front door",
 "cover the corridor with motion sensors"), just do it — annotations
 would be friction.
 
+PROACTIVE DOORS: when looking at a floor that has walls but no doors,
+or when the user explicitly asks you to add doors, use add_door at
+plausible openings (gap in a long wall, or the obvious entry side of
+a room). Doors render as wood-textured slabs in the 3D view and gate
+the simulator's walkthrough. Aim for 1 door per room — front entries
+unlocked, server/IT/storage rooms locked.
+
 Warnings work similarly: if you notice a real issue while doing other
 work, drop add_annotation kind="warning" rather than burying it in text.
 

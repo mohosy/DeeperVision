@@ -22,6 +22,8 @@ import { SubjectTrail3D } from "@/components/simulation/SubjectTrail3D";
 import { CameraFOV3D } from "@/components/simulation/CameraFOV3D";
 import { useSimStore as useSimStoreLib } from "@/lib/sim-store";
 import { DeviceMesh } from "./DeviceMesh";
+import { Door3D } from "./Door3D";
+import { drywallTexture, woodFloorTexture } from "./textures";
 
 interface Scene3DCanvasProps {
   width: number;
@@ -156,19 +158,7 @@ export function Scene3DCanvas({
 
   function onContainerDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
-
-    // Pegman drop — switches to walk mode at the dropped world point
-    const pegman = e.dataTransfer.getData("application/x-dv-pegman");
-    if (pegman === "1") {
-      const world = dropPointWorld(e.clientX, e.clientY);
-      if (!world) return;
-      useDesignStore
-        .getState()
-        .setWalkSpawnOverride([world.x, 1.65, world.z]);
-      useDesignStore.getState().setThreeDMode("walk");
-      return;
-    }
-
+    // Library devices still use the HTML5 drag-and-drop API.
     const raw = e.dataTransfer.getData("application/x-dv-device");
     if (!raw) return;
     try {
@@ -182,9 +172,33 @@ export function Scene3DCanvas({
     }
   }
 
+  // Pegman uses pointer events (not HTML5 DnD) so the cursor can carry a
+  // live 3D character. The Pegman button dispatches `dv-pegman-drop` on
+  // pointerup if the cursor was over this container. We listen for the
+  // event here and run the same raycast → walk-mode flow.
+  useEffect(() => {
+    function onPegmanDrop(e: Event) {
+      const detail = (e as CustomEvent<{ clientX: number; clientY: number }>)
+        .detail;
+      if (!detail) return;
+      const world = dropPointWorld(detail.clientX, detail.clientY);
+      if (!world) return;
+      useDesignStore
+        .getState()
+        .setWalkSpawnOverride([world.x, 1.65, world.z]);
+      useDesignStore.getState().setThreeDMode("walk");
+    }
+    window.addEventListener("dv-pegman-drop", onPegmanDrop);
+    return () => window.removeEventListener("dv-pegman-drop", onPegmanDrop);
+    // dropPointWorld closes over handlesRef + containerRef + currentFloor,
+    // which are stable refs / read live — no extra deps needed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div
       ref={containerRef}
+      data-dv-scene3d-drop="true"
       className="absolute inset-0"
       style={{ width, height }}
       onDrop={onContainerDrop}
@@ -264,15 +278,17 @@ export function Scene3DCanvas({
           infiniteGrid
         />
 
-        {/* Floor */}
-        <mesh
-          receiveShadow
-          rotation={[-Math.PI / 2, 0, 0]}
-          position={[center.x, 0, center.z]}
-        >
-          <planeGeometry args={[span.x * 1.1, span.z * 1.1]} />
-          <meshStandardMaterial color={floorColor} roughness={0.85} metalness={0} />
-        </mesh>
+        {/* Floor — light oak plank texture when in light mode, walnut
+            grain in dark mode. Texture repeat scales with span so the
+            plank size reads as ~1m per plank regardless of room size. */}
+        <FloorPlane
+          center={[center.x, center.z]}
+          width={span.x * 1.1}
+          depth={span.z * 1.1}
+          isLight={isLight}
+          floorColor={floorColor}
+        />
+
 
         <ContactShadows
           position={[center.x, 0.005, center.z]}
@@ -292,6 +308,20 @@ export function Scene3DCanvas({
             ceilingHeight={floor.ceilingHeight}
             color={wallColor}
             baseboardColor={baseboardColor}
+            isLight={isLight}
+          />
+        ))}
+
+        {/* Doors — rendered as wood-textured slabs at the wall position
+            indicated in the design. Doesn't cut the wall geometry; the
+            door reads as "this is the door on this wall" via positioning
+            + texture. */}
+        {(floor.doors ?? []).map((door) => (
+          <Door3D
+            key={door.id}
+            door={door}
+            scale={floor.scale}
+            isLight={isLight}
           />
         ))}
 
@@ -381,6 +411,54 @@ function SimulationOverlay({
   );
 }
 
+/**
+ * Floor plane with a tiling wood texture. Repeats are computed so each
+ * "plank" reads as ~1m long regardless of how big the room is — keeps
+ * the perceived grain density consistent.
+ */
+function FloorPlane({
+  center,
+  width,
+  depth,
+  isLight,
+  floorColor,
+}: {
+  center: [number, number];
+  width: number;
+  depth: number;
+  isLight: boolean;
+  floorColor: string;
+}) {
+  const texture = useMemo(() => {
+    const base = woodFloorTexture({
+      base: floorColor,
+      grain: isLight ? "#8a6634" : "#1f1812",
+    });
+    const tex = base.clone();
+    // Each tile of the canvas (4 planks tall) covers ~4m, so divide by 4
+    // to get one plank per meter.
+    tex.repeat.set(Math.max(1, width / 4), Math.max(1, depth / 4));
+    tex.needsUpdate = true;
+    return tex;
+  }, [floorColor, isLight, width, depth]);
+
+  return (
+    <mesh
+      receiveShadow
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[center[0], 0, center[1]]}
+    >
+      <planeGeometry args={[width, depth]} />
+      <meshStandardMaterial
+        map={texture}
+        color={floorColor}
+        roughness={0.7}
+        metalness={0.04}
+      />
+    </mesh>
+  );
+}
+
 function FramingInit({
   cameraPos,
   target,
@@ -452,12 +530,14 @@ function Wall3D({
   ceilingHeight,
   color = "#3a3530",
   baseboardColor = "#1a1612",
+  isLight = true,
 }: {
   wall: Wall;
   scale: number;
   ceilingHeight: number;
   color?: string;
   baseboardColor?: string;
+  isLight?: boolean;
 }) {
   const start = { x: wall.start.x / scale, z: wall.start.y / scale };
   const end = { x: wall.end.x / scale, z: wall.end.y / scale };
@@ -471,6 +551,20 @@ function Wall3D({
   const baseboardThickness = 0.18;
   const baseboardHeight = 0.1;
 
+  // Cloned per-wall texture so we can set independent `.repeat` based on
+  // this wall's length (longer walls get more grain repeats so the noise
+  // density stays consistent regardless of wall size).
+  const wallTex = useMemo(() => {
+    const base = drywallTexture({ base: color, grain: isLight ? 0.09 : 0.14 });
+    const clone = base.clone();
+    clone.repeat.set(
+      Math.max(1, length / 1.6),
+      Math.max(1, ceilingHeight / 1.6),
+    );
+    clone.needsUpdate = true;
+    return clone;
+  }, [color, isLight, length, ceilingHeight]);
+
   return (
     <group position={[cx, 0, cz]} rotation={[0, -angle, 0]}>
       {/* Main wall */}
@@ -480,7 +574,7 @@ function Wall3D({
         position={[0, ceilingHeight / 2, 0]}
       >
         <boxGeometry args={[length, ceilingHeight, wallThickness]} />
-        <meshStandardMaterial color={color} roughness={0.78} />
+        <meshStandardMaterial map={wallTex} color={color} roughness={0.82} />
       </mesh>
       {/* Baseboard trim — slightly proud of the wall so it reads as a
          distinct band of dark wood/paint at the floor */}

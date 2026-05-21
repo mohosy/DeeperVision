@@ -1,16 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
-import { Box, Compass, Eye, LogOut, Move3d, Sparkles } from "lucide-react";
+import { Box, Compass, Eye, LogOut, Move3d } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useActiveFloor, useDesignStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { LayerToggles } from "@/components/editor/LayerToggles";
-import {
-  PegmanThumbnail,
-  type PegmanThumbnailHandle,
-} from "./PegmanThumbnail";
+import { PegmanThumbnail } from "./PegmanThumbnail";
 
 const Scene3DCanvas = dynamic(
   () => import("./Scene3DCanvas").then((m) => m.Scene3DCanvas),
@@ -21,8 +19,6 @@ export function Scene3D({ showSim = false }: { showSim?: boolean } = {}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const floor = useActiveFloor();
-  const showCoverage = useDesignStore((s) => s.showCoverage);
-  const toggleCoverage = useDesignStore((s) => s.toggleCoverage);
   const threeDMode = useDesignStore((s) => s.threeDMode);
   const setThreeDMode = useDesignStore((s) => s.setThreeDMode);
   const cameraPovTargetId = useDesignStore((s) => s.cameraPovTargetId);
@@ -75,28 +71,6 @@ export function Scene3D({ showSim = false }: { showSim?: boolean } = {}) {
                 first-person walker (Google-Maps-style) */}
             {!isEmpty && <Pegman />}
           </div>
-          <div className="my-1 h-px w-full bg-border/60" />
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  onClick={toggleCoverage}
-                  className={cn(
-                    "flex size-9 items-center justify-center rounded-lg border transition-colors",
-                    showCoverage
-                      ? "border-primary bg-primary/20 text-primary"
-                      : "border-transparent text-muted-foreground hover:text-foreground hover:bg-accent"
-                  )}
-                >
-                  <Sparkles className="size-4" />
-                </button>
-              }
-            />
-            <TooltipContent side="right">
-              {showCoverage ? "Hide coverage" : "Show coverage"}
-            </TooltipContent>
-          </Tooltip>
         </div>
       </div>
 
@@ -175,66 +149,125 @@ function CornerMark({ className, rotate = 0 }: { className?: string; rotate?: nu
 /**
  * Draggable "Pegman" — modeled after Google Maps' character icon. The
  * button itself renders the actual 3D Pegman character (same model the
- * simulator's walking subject uses), and on drag start we snapshot that
- * canvas to a PNG data URL so the cursor carries the real 3D character
- * — not a flat icon or emoji.
+ * simulator's walking subject uses).
  *
- * Drop the cursor anywhere on the 3D scene → Scene3DCanvas raycasts to
- * find the floor world point, sets walkSpawnOverride, and switches into
- * walk mode.
+ * We use POINTER EVENTS instead of HTML5 drag-and-drop so the cursor
+ * carries a LIVE 3D canvas (not a static PNG snapshot). The native drag
+ * image API locks the preview at dragstart, so it can never animate.
+ * With pointer events we render a fixed-position portal'd PegmanThumbnail
+ * that follows the cursor in real time, and on pointerup we dispatch a
+ * custom event so Scene3DCanvas can raycast the drop point.
+ *
+ * Drop the cursor anywhere on the 3D scene → Scene3DCanvas listens for
+ * the custom 'dv-pegman-drop' event, raycasts to the floor, sets
+ * walkSpawnOverride, and switches into walk mode.
  */
 function Pegman() {
-  const thumbnailRef = useRef<PegmanThumbnailHandle>(null);
+  const [dragging, setDragging] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const draggingRef = useRef(false);
 
-  function handleDragStart(e: React.DragEvent) {
-    e.dataTransfer.setData("application/x-dv-pegman", "1");
-    e.dataTransfer.effectAllowed = "copy";
-
-    // Snapshot the live 3D thumbnail to a PNG and use that as the drag
-    // image. The cursor visually carries the real character (orange cap,
-    // cyan shirt, navy pants — same as the simulation walker) instead of
-    // a flat lucide icon.
-    const dataUrl = thumbnailRef.current?.snapshot();
-    if (dataUrl) {
-      const img = new Image();
-      img.src = dataUrl;
-      // Slight enlargement so the drag cursor reads at a comfortable size
-      // even though the button itself is 36×36.
-      img.style.position = "fixed";
-      img.style.top = "-1000px";
-      img.style.left = "-1000px";
-      img.style.width = "64px";
-      img.style.height = "64px";
-      img.style.filter = "drop-shadow(0 6px 12px rgba(0, 0, 0, 0.35))";
-      document.body.appendChild(img);
-      e.dataTransfer.setDragImage(img, 32, 32);
-      window.setTimeout(() => img.remove(), 0);
+  // Track pointer movement while dragging. Listening at the window level
+  // means we keep tracking even when the cursor leaves the button.
+  useEffect(() => {
+    if (!dragging) return;
+    function onMove(e: PointerEvent) {
+      setPos({ x: e.clientX, y: e.clientY });
     }
+    function onUp(e: PointerEvent) {
+      // Find the topmost element under the cursor and check whether it
+      // (or an ancestor) is the 3D scene's drop zone. We tag the scene's
+      // container with data-dv-scene3d-drop so the lookup is robust to
+      // future DOM changes.
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const sceneDrop = el?.closest("[data-dv-scene3d-drop]");
+      if (sceneDrop) {
+        window.dispatchEvent(
+          new CustomEvent("dv-pegman-drop", {
+            detail: { clientX: e.clientX, clientY: e.clientY },
+          }),
+        );
+      }
+      draggingRef.current = false;
+      setDragging(false);
+    }
+    function onCancel() {
+      draggingRef.current = false;
+      setDragging(false);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+    };
+  }, [dragging]);
+
+  function handlePointerDown(e: React.PointerEvent) {
+    // Only respond to primary-button (left mouse / touch). Avoid
+    // hijacking right-click or middle-click.
+    if (e.button !== 0 && e.pointerType === "mouse") return;
+    e.preventDefault();
+    setPos({ x: e.clientX, y: e.clientY });
+    draggingRef.current = true;
+    setDragging(true);
   }
 
   return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <button
-            type="button"
-            draggable
-            onDragStart={handleDragStart}
-            className={cn(
-              "flex size-9 items-center justify-center rounded-lg border border-transparent transition-colors",
-              "hover:bg-accent",
-              "cursor-grab active:cursor-grabbing overflow-hidden",
-            )}
-            aria-label="Drag onto the scene to walk through the building"
+    <>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              onPointerDown={handlePointerDown}
+              className={cn(
+                "flex size-8 items-center justify-center rounded-lg border border-transparent transition-colors",
+                "hover:bg-accent",
+                "cursor-grab active:cursor-grabbing overflow-hidden",
+                "select-none touch-none",
+              )}
+              style={{ touchAction: "none" }}
+              aria-label="Drag onto the scene to walk through the building"
+            >
+              {/* The button itself stays mounted with its own 3D canvas so
+                  it visibly stays "the avatar's home" even while the user
+                  is dragging a portal'd copy around. */}
+              <PegmanThumbnail />
+            </button>
+          }
+        />
+        <TooltipContent side="right">
+          Drag onto the scene to walk
+        </TooltipContent>
+      </Tooltip>
+
+      {/* Live 3D Pegman floating at the cursor while dragging. Portal'd to
+          <body> so it can escape any sidebar overflow:hidden, and
+          pointer-events:none so document.elementFromPoint can see the
+          scene canvas underneath. */}
+      {dragging &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            aria-hidden
+            className="pointer-events-none fixed z-[9999]"
+            style={{
+              left: pos.x,
+              top: pos.y,
+              transform: "translate(-50%, -50%)",
+              width: 64,
+              height: 64,
+              filter: "drop-shadow(0 6px 14px rgba(0, 0, 0, 0.35))",
+            }}
           >
-            <PegmanThumbnail ref={thumbnailRef} />
-          </button>
-        }
-      />
-      <TooltipContent side="right">
-        Drag onto the scene to walk
-      </TooltipContent>
-    </Tooltip>
+            <PegmanThumbnail />
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 
