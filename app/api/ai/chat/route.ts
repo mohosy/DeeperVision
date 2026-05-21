@@ -2,29 +2,28 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { NextRequest } from "next/server";
 
 /**
- * AI Chat endpoint — "Cursor for floor plans".
+ * AI Chat endpoint — "Cursor for floor plans", agentic edition.
  *
- * The user talks to Claude in a side panel. Claude has tools to mutate the
- * active floor: add / move / rotate / remove / update devices, add walls,
- * and recommend changes without committing.
+ * This is an SSE streaming endpoint. The client posts conversation history +
+ * the current floor state, the server runs a multi-turn tool-use loop against
+ * Claude, and pushes structured events to the client as they happen:
  *
- * Architecture mirrors the other AI routes:
- *   • Client sends the conversation history + current floor state.
- *   • Server injects the floor snapshot into the last user message so Claude
- *     always sees the latest design.
- *   • Claude calls tools; we collect each call into an `operations[]` queue.
- *   • The route returns Claude's final assistant text + the queued ops.
- *   • Client applies ops to the store and shows the text inline.
+ *   event: text             → { delta }     incremental text (Claude is typing)
+ *   event: operation        → { ...op }     a parsed tool call ready to apply
+ *   event: web_search       → { query }     Claude is searching the web
+ *   event: web_search_done  → { count }     a web search completed
+ *   event: citation         → { url, title, cited_text }
+ *   event: turn             → { index }     a new turn of the agent loop started
+ *   event: done             → { usage }     loop finished cleanly
+ *   event: error            → { message }
  *
- * The endpoint is intentionally stateless — the design lives in the client
- * store. We just translate "natural language" → "structured edit ops".
+ * The endpoint is intentionally stateless — the floor lives in the client
+ * store. We just translate natural language → structured edits and stream
+ * the work as it happens.
  */
 
 const MODEL = "claude-sonnet-4-5";
-// Max turns of tool-use in a single request. Each turn = one model call.
-// 8 is plenty: bulk operations like "add 4 cameras at the corners" usually
-// resolve in 1-2 turns.
-const MAX_TURNS = 8;
+const MAX_TURNS = 12;
 
 interface FloorSnapshot {
   name: string;
@@ -75,21 +74,9 @@ export type ChatOperation =
       mountHeightM?: number;
       notes?: string;
     }
-  | {
-      kind: "move-device";
-      deviceId: string;
-      newX: number;
-      newY: number;
-    }
-  | {
-      kind: "rotate-device";
-      deviceId: string;
-      newRotationDegrees: number;
-    }
-  | {
-      kind: "remove-device";
-      deviceId: string;
-    }
+  | { kind: "move-device"; deviceId: string; newX: number; newY: number }
+  | { kind: "rotate-device"; deviceId: string; newRotationDegrees: number }
+  | { kind: "remove-device"; deviceId: string }
   | {
       kind: "update-device";
       deviceId: string;
@@ -100,23 +87,21 @@ export type ChatOperation =
       notes?: string;
       installStatus?: "proposed" | "installed" | "decommissioned";
     }
+  | { kind: "add-wall"; startX: number; startY: number; endX: number; endY: number }
+  | { kind: "remove-wall"; wallId: string }
   | {
-      kind: "add-wall";
-      startX: number;
-      startY: number;
-      endX: number;
-      endY: number;
-    };
+      kind: "add-door";
+      x: number;
+      y: number;
+      rotationDegrees: number;
+      widthMeters: number;
+      wallId: string;
+      locked: boolean;
+      label: string;
+    }
+  | { kind: "set-floor-scale"; scalePxPerMeter: number };
 
-interface ChatResponse {
-  /** Plain-text reply to show in the chat panel. */
-  reply: string;
-  /** Structured edits the client should apply to the floor. */
-  operations: ChatOperation[];
-  usage: { inputTokens: number; outputTokens: number };
-}
-
-const TOOLS: Anthropic.Messages.Tool[] = [
+const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "add_device",
     description:
@@ -124,10 +109,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
     input_schema: {
       type: "object",
       properties: {
-        type: {
-          type: "string",
-          enum: ["camera", "reader", "sensor", "network"],
-        },
+        type: { type: "string", enum: ["camera", "reader", "sensor", "network"] },
         subtype: {
           type: "string",
           description:
@@ -148,7 +130,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "move_device",
     description:
-      "Move an existing device by its id to a new (x, y) position in floor-plan pixels.",
+      "Move an existing device by id to a new (x, y) position in floor-plan pixels.",
     input_schema: {
       type: "object",
       properties: {
@@ -161,8 +143,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   },
   {
     name: "rotate_device",
-    description:
-      "Rotate an existing device by its id. Rotation is in degrees, 0=east, 90=south.",
+    description: "Rotate an existing device by id (degrees, 0=east, 90=south).",
     input_schema: {
       type: "object",
       properties: {
@@ -177,9 +158,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
     description: "Delete a device by id.",
     input_schema: {
       type: "object",
-      properties: {
-        deviceId: { type: "string" },
-      },
+      properties: { deviceId: { type: "string" } },
       required: ["deviceId"],
     },
   },
@@ -207,7 +186,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "add_wall",
     description:
-      "Add a wall segment to the floor. Use only when the user explicitly asks to draw or extend walls. Coordinates are floor-plan pixels.",
+      "Add a wall segment to the floor. Coordinates are floor-plan pixels.",
     input_schema: {
       type: "object",
       properties: {
@@ -219,37 +198,122 @@ const TOOLS: Anthropic.Messages.Tool[] = [
       required: ["startX", "startY", "endX", "endY"],
     },
   },
+  {
+    name: "remove_wall",
+    description: "Delete a wall segment by id.",
+    input_schema: {
+      type: "object",
+      properties: { wallId: { type: "string" } },
+      required: ["wallId"],
+    },
+  },
+  {
+    name: "add_door",
+    description:
+      "Add a door on a specific wall at a given (x, y) point in floor-plan pixels. The door is associated with a wallId from the current floor state. rotationDegrees should align with the wall direction.",
+    input_schema: {
+      type: "object",
+      properties: {
+        wallId: { type: "string" },
+        x: { type: "number" },
+        y: { type: "number" },
+        rotationDegrees: { type: "number" },
+        widthMeters: {
+          type: "number",
+          description: "Door width in meters. Defaults: 0.9 (standard), 1.2 (wide), 1.8 (double).",
+        },
+        locked: { type: "boolean" },
+        label: { type: "string" },
+      },
+      required: ["wallId", "x", "y", "rotationDegrees", "label"],
+    },
+  },
+  {
+    name: "set_floor_scale",
+    description:
+      "Update the floor's pixels-per-meter scale. Use only when the user explicitly wants to recalibrate, or when web search reveals a building dimension that contradicts the current scale.",
+    input_schema: {
+      type: "object",
+      properties: { pixelsPerMeter: { type: "number" } },
+      required: ["pixelsPerMeter"],
+    },
+  },
 ];
 
-const SYSTEM_PROMPT = `You are the in-app AI editor for DeeperVision, a CAD tool for designing commercial security systems. You're embedded in a chat panel on the right side of the editor. The user is sitting in front of their floor plan and talking to you the way they'd talk to a co-worker reviewing the design.
+/**
+ * Server tool: lets Claude search the web for product specs, pricing, code
+ * requirements, etc. The API runs the search and returns results directly
+ * to Claude; the client never sees raw search content, only the citations
+ * Claude chooses to surface in its reply.
+ */
+const WEB_SEARCH_TOOL = {
+  type: "web_search_20250305",
+  name: "web_search",
+  max_uses: 5,
+} as const;
 
-Your job:
-• Read the current floor state (walls + devices + doors) provided in each user message.
-• When the user asks for a change, MAKE the change by calling the appropriate tool(s) — don't just describe what they should do.
-• When the user asks a question or for advice, answer concisely. Only call tools when there's a real edit to perform.
+const SYSTEM_PROMPT = `You are the in-app AI editor for DeeperVision, a CAD tool for designing commercial security systems. You're embedded in a right-side chat panel — the user is sitting in front of their floor plan, looking at it on the same screen as your reply.
 
-Tools you can call:
+You are an AGENTIC editor. Plan, act, and verify across multiple tool calls in a single turn. Don't ask permission for small changes — apply them and explain after.
+
+═══ TOOLS ═══
+
+DESIGN EDITS (apply to the floor immediately, client-side):
   add_device          add a camera / reader / sensor / network device
-  move_device         move a device (by id) to new coordinates
+  move_device         relocate a device by id
   rotate_device       change a device's rotation
   remove_device       delete a device
-  update_device       change label / range / FOV / mount height / status / notes
-  add_wall            add a wall segment (use sparingly — only on explicit request)
+  update_device       change label / range / FOV / mount / status / notes
+  add_wall            draw a wall segment
+  remove_wall         delete a wall by id
+  add_door            add a door on a wall by id
+  set_floor_scale     recalibrate pixels-per-meter
 
-Coordinate system: floor-plan pixels, top-left origin, X right, Y down. The scale is given as pixels-per-meter; convert when the user talks in meters or feet.
+RESEARCH (server-side; results stream back as citations):
+  web_search          search the web — use this when the user asks for specific
+                      product pricing, current code requirements, regional
+                      regulations, manufacturer specs, or anything you don't
+                      already know with confidence. Always cite sources.
 
-Style:
-• Be concise. 1-3 sentences typically.
-• Don't restate what you're about to do — just do it. The UI shows applied operations as chips below your message.
-• Prefer realistic placements: cameras at wall corners ~2.8 m mount height, readers near doors ~1.2 m, motion sensors ceiling-mounted in the middle of rooms.
-• For "add cameras to cover X", aim for ~80% coverage, not over-instrumented. Most rooms need 1-2 cameras; long corridors need a camera per ~12 m.
-• When asked "where would you put …?", you can either suggest with text OR go ahead and add it. If unsure, suggest first; if it's clearly a directive ("add a camera at the front door"), just do it.
-• If the user asks something you can't do with the tools (e.g. "change the wall color"), say so briefly and offer the closest alternative.
-• Use existing device ids (dev_xxx) when modifying — never invent ids.
+═══ COORDINATES ═══
 
-Safety:
+Floor-plan pixels, top-left origin, X right, Y down. The scale is given as
+pixels-per-meter in the floor state. Convert when the user talks in meters
+or feet ("1 m off the wall" → scalePxPerMeter pixels).
+
+═══ AGENTIC BEHAVIOR ═══
+
+When the user asks a complex request, run a multi-step plan:
+  1. If product/pricing/code info is needed → call web_search FIRST.
+  2. Apply concrete edits via the domain tools.
+  3. End with a short text summary referencing any citations.
+
+Multiple tool calls per turn are encouraged. Example:
+  user: "Find the cheapest 4K dome camera under $300 and place one at each
+        corner of the conference room."
+  → web_search("cheap 4K dome IP camera under \\$300 2024")
+  → 4× add_device with the model from the top result
+  → text: "Placed 4× <Model> ($XXX each from <vendor>) at the corners."
+
+═══ STYLE ═══
+
+• Be concise — 1–4 sentences typically.
+• Don't restate what you're about to do; just do it. Operation chips show
+  applied edits in the UI.
+• Cite sources whenever you used web_search.
+• Prefer realistic placements: cameras at wall corners ~2.8 m, readers near
+  doors ~1.2 m, motion sensors ceiling-mounted in room centers.
+• For "add cameras to cover X", aim for ~80% coverage. A small room needs
+  1–2 cameras; long corridors need one per ~12 m.
+• Use existing device ids (dev_xxx) and wall ids (wall_xxx) when modifying —
+  never invent ids.
+
+═══ SAFETY ═══
+
 • Don't bulk-delete devices without an obvious user instruction.
-• When in doubt, propose in text rather than acting.`;
+• Don't change the floor scale without good reason (web evidence or explicit
+  request).
+• Refuse politely if the user asks something the tools can't do.`;
 
 export async function POST(request: NextRequest) {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -267,108 +331,198 @@ export async function POST(request: NextRequest) {
   }
 
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return Response.json(
-      { error: "messages[] is required." },
-      { status: 400 },
-    );
+    return Response.json({ error: "messages[] is required." }, { status: 400 });
   }
   if (!body.floor) {
     return Response.json({ error: "floor is required." }, { status: 400 });
   }
 
+  // Build the streaming SSE response.
+  const encoder = new TextEncoder();
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  // Inject the current floor snapshot into the LAST user message so Claude
-  // always sees the freshest state — even on multi-turn conversations where
-  // prior turns mutated the floor.
-  const floorContext = formatFloorContext(body);
-  const claudeMessages: Anthropic.Messages.MessageParam[] = body.messages.map(
-    (m, i, arr) => {
-      const isLastUser = m.role === "user" && i === arr.length - 1;
-      const content = isLastUser
-        ? `${floorContext}\n\nUser: ${m.content}`
-        : m.content;
-      return { role: m.role, content };
-    },
-  );
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      function send(event: string, data: unknown) {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
+        );
+      }
 
-  const operations: ChatOperation[] = [];
-  let reply = "";
-  let totalInput = 0;
-  let totalOutput = 0;
+      try {
+        const floorContext = formatFloorContext(body);
 
-  try {
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const response = await client.messages.create({
-        model: MODEL,
-        max_tokens: 2048,
-        system: SYSTEM_PROMPT,
-        tools: TOOLS,
-        messages: claudeMessages,
-      });
+        // Inject the floor snapshot into the LAST user message so Claude
+        // always sees the freshest state — even on multi-turn convos where
+        // prior turns mutated the floor.
+        const claudeMessages: Anthropic.Messages.MessageParam[] = body.messages.map(
+          (m, i, arr) => {
+            const isLastUser = m.role === "user" && i === arr.length - 1;
+            const content = isLastUser
+              ? `${floorContext}\n\nUser: ${m.content}`
+              : m.content;
+            return { role: m.role, content };
+          },
+        );
 
-      totalInput += response.usage.input_tokens;
-      totalOutput += response.usage.output_tokens;
+        let totalIn = 0;
+        let totalOut = 0;
+        let webSearchCount = 0;
 
-      // Capture text content as the reply. Successive turns may produce
-      // additional text — concatenate so the user sees the full thought.
-      for (const block of response.content) {
-        if (block.type === "text" && block.text.trim()) {
-          reply += (reply ? "\n\n" : "") + block.text.trim();
+        for (let turn = 0; turn < MAX_TURNS; turn++) {
+          send("turn", { index: turn });
+
+          // For each turn we open a streaming Messages call. The stream
+          // emits content_block_start/delta/stop events that we translate
+          // into our SSE events.
+          const apiStream = client.messages.stream({
+            model: MODEL,
+            max_tokens: 4096,
+            system: SYSTEM_PROMPT,
+            tools: [
+              ...DOMAIN_TOOLS,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              WEB_SEARCH_TOOL as any,
+            ],
+            messages: claudeMessages,
+          });
+
+          /**
+           * Per-block scratch — keyed by the streaming block index. We
+           * accumulate input_json_delta chunks into a complete JSON string
+           * and parse it on content_block_stop.
+           */
+          const blocks = new Map<
+            number,
+            {
+              type: "tool_use" | "server_tool_use" | "text";
+              name?: string;
+              id?: string;
+              json: string;
+            }
+          >();
+
+          for await (const event of apiStream) {
+            if (event.type === "content_block_start") {
+              const cb = event.content_block;
+              if (cb.type === "tool_use") {
+                blocks.set(event.index, {
+                  type: "tool_use",
+                  name: cb.name,
+                  id: cb.id,
+                  json: "",
+                });
+              } else if (cb.type === "server_tool_use") {
+                blocks.set(event.index, {
+                  type: "server_tool_use",
+                  name: cb.name,
+                  id: cb.id,
+                  json: "",
+                });
+              } else if (cb.type === "text") {
+                blocks.set(event.index, { type: "text", json: "" });
+              } else if (cb.type === "web_search_tool_result") {
+                // The server-side search finished — tell the UI to switch
+                // its "searching…" indicator to "found".
+                webSearchCount++;
+                send("web_search_done", { count: webSearchCount });
+              }
+            } else if (event.type === "content_block_delta") {
+              const d = event.delta;
+              if (d.type === "text_delta") {
+                send("text", { delta: d.text });
+              } else if (d.type === "input_json_delta") {
+                const b = blocks.get(event.index);
+                if (b) b.json += d.partial_json;
+              } else if (d.type === "citations_delta") {
+                const c = d.citation;
+                if (c.type === "web_search_result_location") {
+                  send("citation", {
+                    url: c.url,
+                    title: c.title,
+                    cited_text: c.cited_text,
+                  });
+                }
+              }
+            } else if (event.type === "content_block_stop") {
+              const b = blocks.get(event.index);
+              if (!b) continue;
+              if (b.type === "server_tool_use" && b.name === "web_search") {
+                try {
+                  const input = JSON.parse(b.json || "{}") as { query?: string };
+                  if (input.query) send("web_search", { query: input.query });
+                } catch {
+                  /* swallow malformed JSON */
+                }
+              } else if (b.type === "tool_use" && b.name) {
+                try {
+                  const input = JSON.parse(b.json) as Record<string, unknown>;
+                  const op = toolUseToOperation(b.name, input);
+                  if (op) send("operation", op);
+                } catch {
+                  /* swallow malformed tool JSON */
+                }
+              }
+              blocks.delete(event.index);
+            }
+          }
+
+          const finalMessage = await apiStream.finalMessage();
+          totalIn += finalMessage.usage.input_tokens;
+          totalOut += finalMessage.usage.output_tokens;
+
+          if (finalMessage.stop_reason !== "tool_use") break;
+
+          // Build tool_results for client-side tools so Claude can continue.
+          // Server-side tools (web_search) already have their results inline
+          // in finalMessage.content — we skip them here.
+          const clientToolUses = finalMessage.content.filter(
+            (
+              c,
+            ): c is Anthropic.Messages.ToolUseBlock =>
+              c.type === "tool_use",
+          );
+          if (clientToolUses.length === 0) break;
+
+          claudeMessages.push(
+            { role: "assistant", content: finalMessage.content },
+            {
+              role: "user",
+              content: clientToolUses.map((t) => ({
+                type: "tool_result" as const,
+                tool_use_id: t.id,
+                content: "ok",
+              })),
+            },
+          );
         }
+
+        send("done", {
+          usage: { inputTokens: totalIn, outputTokens: totalOut },
+          webSearches: webSearchCount,
+        });
+      } catch (err) {
+        const { message } = extractAnthropicError(err);
+        send("error", { message });
+      } finally {
+        controller.close();
       }
+    },
+  });
 
-      const toolUses = response.content.filter(
-        (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use",
-      );
-
-      for (const tool of toolUses) {
-        const op = toolUseToOperation(tool);
-        if (op) operations.push(op);
-      }
-
-      if (response.stop_reason !== "tool_use") break;
-
-      claudeMessages.push(
-        { role: "assistant", content: response.content },
-        {
-          role: "user",
-          content: toolUses.map((t) => ({
-            type: "tool_result" as const,
-            tool_use_id: t.id,
-            content: "ok",
-          })),
-        },
-      );
-    }
-  } catch (err) {
-    const { message, status } = extractAnthropicError(err);
-    return Response.json({ error: message }, { status });
-  }
-
-  // If Claude only emitted tool calls and no text, fall back to a brief
-  // confirmation so the chat doesn't look empty.
-  if (!reply.trim()) {
-    if (operations.length > 0) {
-      reply = `Applied ${operations.length} change${operations.length === 1 ? "" : "s"}.`;
-    } else {
-      reply = "Done.";
-    }
-  }
-
-  const result: ChatResponse = {
-    reply,
-    operations,
-    usage: { inputTokens: totalInput, outputTokens: totalOutput },
-  };
-  return Response.json(result);
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      // Prevent nginx-style buffering for SSE on edge / proxies
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
-/**
- * Render the current floor as a compact text block Claude can quickly
- * skim. Keeps formatting parallel to the advisor route so Claude reasons
- * about both endpoints the same way.
- */
+/* -------------------------------------------------------------------------- */
+
 function formatFloorContext(body: ChatRequestBody): string {
   const { floor, designName, buildingType } = body;
   const lines: string[] = [];
@@ -381,27 +535,28 @@ function formatFloorContext(body: ChatRequestBody): string {
   );
   lines.push(`Ceiling height: ${floor.ceilingHeightM.toFixed(1)} m`);
   if (floor.imageWidth && floor.imageHeight) {
-    lines.push(`Floor plan image: ${floor.imageWidth} × ${floor.imageHeight} px`);
+    lines.push(
+      `Floor plan image: ${floor.imageWidth} × ${floor.imageHeight} px`,
+    );
   }
 
   lines.push("");
   lines.push(`Walls (${floor.walls.length}):`);
-  if (floor.walls.length === 0) {
-    lines.push("  (none yet)");
-  } else {
+  if (floor.walls.length === 0) lines.push("  (none yet)");
+  else {
     for (const w of floor.walls.slice(0, 60)) {
       lines.push(
         `  [${w.id}] (${w.startX.toFixed(0)},${w.startY.toFixed(0)}) → (${w.endX.toFixed(0)},${w.endY.toFixed(0)})`,
       );
     }
-    if (floor.walls.length > 60) lines.push(`  …${floor.walls.length - 60} more wall(s) omitted`);
+    if (floor.walls.length > 60)
+      lines.push(`  …${floor.walls.length - 60} more omitted`);
   }
 
   lines.push("");
   lines.push(`Doors (${floor.doors.length}):`);
-  if (floor.doors.length === 0) {
-    lines.push("  (none)");
-  } else {
+  if (floor.doors.length === 0) lines.push("  (none)");
+  else {
     for (const d of floor.doors) {
       lines.push(
         `  [${d.id}] "${d.label}" @ (${d.x.toFixed(0)},${d.y.toFixed(0)}) — ${d.widthMeters} m wide, ${d.locked ? "locked" : "unlocked"}`,
@@ -411,15 +566,14 @@ function formatFloorContext(body: ChatRequestBody): string {
 
   lines.push("");
   lines.push(`Devices (${floor.devices.length}):`);
-  if (floor.devices.length === 0) {
-    lines.push("  (none yet)");
-  } else {
+  if (floor.devices.length === 0) lines.push("  (none yet)");
+  else {
     for (const d of floor.devices) {
-      const subtype = d.subtype ? ` ${d.subtype}` : "";
+      const sub = d.subtype ? ` ${d.subtype}` : "";
       const fov = d.fovDegrees != null ? ` · ${d.fovDegrees}° FOV` : "";
-      const range = d.rangeMeters != null ? ` · ${d.rangeMeters} m range` : "";
+      const rng = d.rangeMeters != null ? ` · ${d.rangeMeters} m range` : "";
       lines.push(
-        `  [${d.id}] ${d.type}${subtype} "${d.label}" @ (${d.x.toFixed(0)},${d.y.toFixed(0)}) rot ${d.rotationDegrees.toFixed(0)}°${fov}${range} · mount ${d.mountHeightM} m · ${d.installStatus}`,
+        `  [${d.id}] ${d.type}${sub} "${d.label}" @ (${d.x.toFixed(0)},${d.y.toFixed(0)}) rot ${d.rotationDegrees.toFixed(0)}°${fov}${rng} · mount ${d.mountHeightM} m · ${d.installStatus}`,
       );
     }
   }
@@ -428,10 +582,10 @@ function formatFloorContext(body: ChatRequestBody): string {
 }
 
 function toolUseToOperation(
-  tool: Anthropic.Messages.ToolUseBlock,
+  name: string,
+  input: Record<string, unknown>,
 ): ChatOperation | null {
-  const input = tool.input as Record<string, unknown>;
-  switch (tool.name) {
+  switch (name) {
     case "add_device": {
       const dtype = input.type as "camera" | "reader" | "sensor" | "network";
       if (!["camera", "reader", "sensor", "network"].includes(dtype)) return null;
@@ -486,9 +640,11 @@ function toolUseToOperation(
       if (!deviceId) return null;
       const op: ChatOperation = { kind: "update-device", deviceId };
       if (typeof input.label === "string") op.label = input.label;
-      if (typeof input.rangeMeters === "number") op.rangeMeters = input.rangeMeters;
+      if (typeof input.rangeMeters === "number")
+        op.rangeMeters = input.rangeMeters;
       if (typeof input.fovDegrees === "number") op.fovDegrees = input.fovDegrees;
-      if (typeof input.mountHeightM === "number") op.mountHeightM = input.mountHeightM;
+      if (typeof input.mountHeightM === "number")
+        op.mountHeightM = input.mountHeightM;
       if (typeof input.notes === "string") op.notes = input.notes;
       if (
         typeof input.installStatus === "string" &&
@@ -501,7 +657,7 @@ function toolUseToOperation(
       }
       return op;
     }
-    case "add_wall": {
+    case "add_wall":
       return {
         kind: "add-wall",
         startX: Number(input.startX) || 0,
@@ -509,6 +665,33 @@ function toolUseToOperation(
         endX: Number(input.endX) || 0,
         endY: Number(input.endY) || 0,
       };
+    case "remove_wall": {
+      const wallId = typeof input.wallId === "string" ? input.wallId : "";
+      if (!wallId) return null;
+      return { kind: "remove-wall", wallId };
+    }
+    case "add_door": {
+      const wallId = typeof input.wallId === "string" ? input.wallId : "";
+      if (!wallId) return null;
+      return {
+        kind: "add-door",
+        wallId,
+        x: Number(input.x) || 0,
+        y: Number(input.y) || 0,
+        rotationDegrees: Number(input.rotationDegrees) || 0,
+        widthMeters:
+          typeof input.widthMeters === "number" ? input.widthMeters : 0.9,
+        locked: input.locked === true,
+        label:
+          typeof input.label === "string" && input.label.trim()
+            ? input.label.trim()
+            : "Door",
+      };
+    }
+    case "set_floor_scale": {
+      const ppm = Number(input.pixelsPerMeter);
+      if (!Number.isFinite(ppm) || ppm < 5 || ppm > 600) return null;
+      return { kind: "set-floor-scale", scalePxPerMeter: ppm };
     }
     default:
       return null;
@@ -524,9 +707,7 @@ function extractAnthropicError(err: unknown): {
       | { error?: { message?: string } }
       | undefined;
     const msg =
-      upstream?.error?.message ??
-      err.message ??
-      "Unknown Anthropic API error.";
+      upstream?.error?.message ?? err.message ?? "Unknown Anthropic API error.";
     const status = err.status >= 400 && err.status < 500 ? err.status : 502;
     return { message: msg, status };
   }
