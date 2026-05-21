@@ -587,40 +587,34 @@ function Device3D({
     }
   }
 
-  return (
-    <group
-      ref={groupRef}
-      position={[px, py, pz]}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-      onClick={(e) => {
-        if (!editable) return;
-        e.stopPropagation();
-        onSelect();
-      }}
-    >
-      {/* Drop indicator on the floor — subtle ring directly below the device
-         shows the mount projection without the unrealistic floor-to-ceiling pole. */}
-      <mesh
-        rotation={[-Math.PI / 2, 0, 0]}
-        position={[0, -py + 0.008, 0]}
-      >
-        <ringGeometry args={[0.06, 0.085, 24]} />
-        <meshBasicMaterial
-          color={accent}
-          transparent
-          opacity={0.35}
-          side={THREE.DoubleSide}
-        />
-      </mesh>
+  // `raycast` set to a no-op makes a mesh visually present but invisible
+  // to pointer events — clicks pass through to OrbitControls. We use this
+  // on every floor decal so the user can drag-to-orbit anywhere without
+  // accidentally grabbing the device.
+  const noPick = () => null;
 
-      <DeviceMesh
-        device={device}
-        accent={accent}
-        emissiveIntensity={emissiveIntensity}
-      />
+  return (
+    <group ref={groupRef} position={[px, py, pz]}>
+      {/* Interactive part — only the device body itself catches pointer
+          events. Floor decals are siblings outside this group, so a click
+          on the floor ring just dismisses through to OrbitControls. */}
+      <group
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onClick={(e) => {
+          if (!editable) return;
+          e.stopPropagation();
+          onSelect();
+        }}
+      >
+        <DeviceMesh
+          device={device}
+          accent={accent}
+          emissiveIntensity={emissiveIntensity}
+        />
+      </group>
 
       {detecting && (
         <pointLight
@@ -631,11 +625,15 @@ function Device3D({
         />
       )}
 
-      {/* Selection halo on the floor */}
+      {/* Selection halo on the floor — only shown when this device is the
+          selected one. Non-pickable so the user can drag-to-orbit through
+          the halo without losing selection or accidentally moving the
+          device. */}
       {selected && (
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
           position={[0, -py + 0.01, 0]}
+          raycast={noPick}
         >
           <ringGeometry args={[0.45, 0.55, 48]} />
           <meshBasicMaterial
@@ -647,9 +645,14 @@ function Device3D({
         </mesh>
       )}
 
-      {/* Sensor detection radius (semi-transparent ring on ground) */}
+      {/* Sensor detection radius (semi-transparent ring on ground) — visible
+          when coverage layer is on. Non-pickable. */}
       {showCoverage && device.type === "sensor" && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -py + 0.005, 0]}>
+        <mesh
+          rotation={[-Math.PI / 2, 0, 0]}
+          position={[0, -py + 0.005, 0]}
+          raycast={noPick}
+        >
           <ringGeometry
             args={[device.rangeMeters - 0.06, device.rangeMeters, 64]}
           />
@@ -662,13 +665,14 @@ function Device3D({
         </mesh>
       )}
 
-      {/* AP coverage disc */}
+      {/* AP coverage disc — non-pickable. */}
       {showCoverage &&
         device.type === "network" &&
         device.networkType === "access-point" && (
           <mesh
             rotation={[-Math.PI / 2, 0, 0]}
             position={[0, -py + 0.005, 0]}
+            raycast={noPick}
           >
             <circleGeometry args={[device.coverageMeters ?? 15, 64]} />
             <meshBasicMaterial color={accent} transparent opacity={0.08} />
