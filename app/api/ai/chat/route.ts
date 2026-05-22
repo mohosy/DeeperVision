@@ -610,6 +610,60 @@ a room). Doors render as wood-textured slabs in the 3D view and gate
 the simulator's walkthrough. Aim for 1 door per room — front entries
 unlocked, server/IT/storage rooms locked.
 
+═══ SPATIAL REASONING — READ BEFORE PLACING DOORS OR DEVICES ═══
+
+The walls list classifies every wall as HORIZONTAL/VERTICAL/DIAGONAL
+and as EXTERIOR (NORTH/SOUTH/EAST/WEST) or INTERIOR. Use this
+vocabulary instead of guessing.
+
+DOOR PLACEMENT — practical rules
+  1. INTERIOR doors go on INTERIOR walls. Don't put an interior
+     door on an EXTERIOR wall — that would be the building
+     entrance. Use that role exactly once, on the wall the user
+     calls out as the front entry.
+  2. A wall typically gets at MOST ONE door. If you already put a
+     door on a wall, pick a different wall for the next room.
+  3. Start from the wall's published mid (mx, my) coordinates. The
+     server snaps the door onto the wall segment anyway, but
+     supplying the midpoint reads as "centered" in 3D.
+  4. Lock doors on rooms that contain sensitive gear (server, IT,
+     records, mechanical). Leave general-use doors unlocked.
+  5. When a room has only one interior wall facing the corridor,
+     that's the door wall — even if other walls are longer.
+
+CAMERA PLACEMENT — practical rules
+  • Mount in corners angled INTO the room (rotation = ~45° offset
+    from the corner). One corner camera per ~6 m of room dimension
+    on the long axis, mounted at 2.6–2.8 m.
+  • Cover every entry/exit with one camera that can see faces.
+  • Hallways: PTZ or bullet at one end, watching the run length.
+  • Don't double-cover the same square footage from cameras owned
+    by overlapping FOVs — flag redundancy as a warning annotation.
+
+READER PLACEMENT — practical rules
+  • Pair every controlled door with a reader on the OUTSIDE
+    (approach) side, ~1 m to the latch side of the door, mounted
+    at 1.2 m.
+  • Server / IT / electrical room doors should always have a
+    reader. Front entries usually have one too.
+
+SENSOR PLACEMENT — practical rules
+  • Motion sensors are ceiling-mounted near the ROOM CENTER.
+  • Glass-break sensors go within 3 m of a window on the inside
+    wall.
+  • Door-contact sensors sit on the door itself — coordinate the
+    door's position via add_door first, then drop the sensor at the
+    same (x, y).
+
+NETWORK GEAR — practical rules
+  • NVR + main switch live together in the server / IT room.
+  • Access points distribute across the floor at ~12 m spacing,
+    centered in their coverage area.
+
+Use the floor-extents centroid + per-wall metadata to make these
+calls. If unsure between two walls, pick the longer INTERIOR wall —
+it'll usually be the correct one.
+
 Warnings work similarly: if you notice a real issue while doing other
 work, drop add_annotation kind="warning" rather than burying it in text.
 
@@ -863,6 +917,17 @@ function formatFloorContext(body: ChatRequestBody): string {
     lines.push(view);
   }
 
+  // Floor bounding box — needed to classify walls as exterior vs interior
+  // and to give the agent an overall sense of the building footprint.
+  const bbox = computeFloorBbox(floor);
+  if (bbox) {
+    const widthM = (bbox.maxX - bbox.minX) / floor.scalePxPerMeter;
+    const heightM = (bbox.maxY - bbox.minY) / floor.scalePxPerMeter;
+    lines.push(
+      `Floor extents: (${bbox.minX.toFixed(0)},${bbox.minY.toFixed(0)}) → (${bbox.maxX.toFixed(0)},${bbox.maxY.toFixed(0)}) — ~${widthM.toFixed(1)} m × ${heightM.toFixed(1)} m, centroid (${(((bbox.minX + bbox.maxX) / 2)).toFixed(0)},${(((bbox.minY + bbox.maxY) / 2)).toFixed(0)}).`,
+    );
+  }
+
   lines.push("");
   lines.push(`Walls (${floor.walls.length}):`);
   if (floor.walls.length === 0) lines.push("  (none yet)");
@@ -874,10 +939,12 @@ function formatFloorContext(body: ChatRequestBody): string {
       const midX = (w.startX + w.endX) / 2;
       const midY = (w.startY + w.endY) / 2;
       const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
-      // Include midpoint, length, and angle so the agent can place
-      // doors / annotations on a wall without guessing coordinates.
+      const orient = classifyWallOrientation(angleDeg);
+      const role = bbox ? classifyWallRole(w, bbox) : "UNKNOWN";
+      // Enriched per-wall line: orientation + exterior/interior +
+      // (for exterior) cardinal direction, plus midpoint/length/angle.
       lines.push(
-        `  [${w.id}] (${w.startX.toFixed(0)},${w.startY.toFixed(0)}) → (${w.endX.toFixed(0)},${w.endY.toFixed(0)}) · mid (${midX.toFixed(0)},${midY.toFixed(0)}) · ${lenPx.toFixed(0)}px @ ${angleDeg.toFixed(0)}°`,
+        `  [${w.id}] ${orient} ${role} wall · mid (${midX.toFixed(0)},${midY.toFixed(0)}) · ${lenPx.toFixed(0)}px @ ${angleDeg.toFixed(0)}° · (${w.startX.toFixed(0)},${w.startY.toFixed(0)})→(${w.endX.toFixed(0)},${w.endY.toFixed(0)})`,
       );
     }
     if (floor.walls.length > 60)
@@ -952,6 +1019,82 @@ function formatFloorContext(body: ChatRequestBody): string {
   }
   lines.push("===========================");
   return lines.join("\n");
+}
+
+/**
+ * Compute the floor's overall pixel-space bounding box from its walls.
+ * Returns null when the floor has no walls (no spatial reference yet).
+ */
+function computeFloorBbox(
+  floor: FloorSnapshot,
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  if (floor.walls.length === 0) return null;
+  let minX = Infinity,
+    minY = Infinity,
+    maxX = -Infinity,
+    maxY = -Infinity;
+  for (const w of floor.walls) {
+    minX = Math.min(minX, w.startX, w.endX);
+    minY = Math.min(minY, w.startY, w.endY);
+    maxX = Math.max(maxX, w.startX, w.endX);
+    maxY = Math.max(maxY, w.startY, w.endY);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+/**
+ * Bucket a wall's angle into HORIZONTAL / VERTICAL / DIAGONAL so the
+ * agent can reason in cardinal terms even without a geometry library.
+ * 15° tolerance — handles slightly skewed traces from the AI Survey.
+ */
+function classifyWallOrientation(
+  angleDeg: number,
+): "HORIZONTAL" | "VERTICAL" | "DIAGONAL" {
+  const a = ((angleDeg % 180) + 180) % 180; // 0..180
+  if (a < 15 || a > 165) return "HORIZONTAL";
+  if (a > 75 && a < 105) return "VERTICAL";
+  return "DIAGONAL";
+}
+
+/**
+ * Classify a wall as EXTERIOR (on the floor's perimeter, one cardinal
+ * side) or INTERIOR (somewhere in the middle, partitioning rooms). For
+ * exterior walls, we also return the cardinal side (NORTH / SOUTH /
+ * EAST / WEST) so the agent can say "front wall" instead of guessing.
+ *
+ * Tolerance: a wall counts as on a perimeter side if both endpoints
+ * are within 10% of the floor's extent of that side.
+ */
+function classifyWallRole(
+  w: { startX: number; startY: number; endX: number; endY: number },
+  bbox: { minX: number; minY: number; maxX: number; maxY: number },
+):
+  | "EXTERIOR NORTH"
+  | "EXTERIOR SOUTH"
+  | "EXTERIOR EAST"
+  | "EXTERIOR WEST"
+  | "INTERIOR" {
+  const w_w = bbox.maxX - bbox.minX;
+  const h_h = bbox.maxY - bbox.minY;
+  const tolX = Math.max(20, w_w * 0.06);
+  const tolY = Math.max(20, h_h * 0.06);
+  const onNorth =
+    Math.abs(w.startY - bbox.minY) < tolY &&
+    Math.abs(w.endY - bbox.minY) < tolY;
+  const onSouth =
+    Math.abs(w.startY - bbox.maxY) < tolY &&
+    Math.abs(w.endY - bbox.maxY) < tolY;
+  const onWest =
+    Math.abs(w.startX - bbox.minX) < tolX &&
+    Math.abs(w.endX - bbox.minX) < tolX;
+  const onEast =
+    Math.abs(w.startX - bbox.maxX) < tolX &&
+    Math.abs(w.endX - bbox.maxX) < tolX;
+  if (onNorth) return "EXTERIOR NORTH";
+  if (onSouth) return "EXTERIOR SOUTH";
+  if (onWest) return "EXTERIOR WEST";
+  if (onEast) return "EXTERIOR EAST";
+  return "INTERIOR";
 }
 
 function toolUseToOperation(
