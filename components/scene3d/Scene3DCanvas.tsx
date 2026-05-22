@@ -23,6 +23,7 @@ import { CameraFOV3D } from "@/components/simulation/CameraFOV3D";
 import { useSimStore as useSimStoreLib } from "@/lib/sim-store";
 import { DeviceMesh } from "./DeviceMesh";
 import { Door3D } from "./Door3D";
+import { Annotation3D } from "./Annotation3D";
 import { drywallTexture, woodFloorTexture } from "./textures";
 
 interface Scene3DCanvasProps {
@@ -322,6 +323,20 @@ export function Scene3DCanvas({
             door={door}
             scale={floor.scale}
             isLight={isLight}
+          />
+        ))}
+
+        {/* Annotations rendered in 3D as floating sticky-note billboards
+            so AI commentary stays visible whether the user is in 2D or
+            3D. Selecting one routes through selectDevice (annotations
+            share that slot in the store, same as doors). */}
+        {(floor.annotations ?? []).map((a) => (
+          <Annotation3D
+            key={a.id}
+            annotation={a}
+            scale={floor.scale}
+            selected={a.id === selectedDeviceId}
+            onSelect={() => selectDevice(a.id)}
           />
         ))}
 

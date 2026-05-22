@@ -31,6 +31,12 @@ interface FloorSnapshot {
   ceilingHeightM: number;
   imageWidth?: number;
   imageHeight?: number;
+  /** Current top-level view mode of the editor. */
+  viewMode?: "2d" | "3d" | "sim";
+  /** Active 3D submode when viewMode is "3d". */
+  threeDMode?: "orbit" | "walk" | "pov";
+  /** When threeDMode is "pov", which camera device is being shown. */
+  cameraPovTargetId?: string;
   walls: { id: string; startX: number; startY: number; endX: number; endY: number }[];
   devices: {
     id: string;
@@ -174,6 +180,12 @@ export type ChatOperation =
       /** Switch the 3D view into first-person POV from a camera device. */
       kind: "view-from-camera";
       deviceId: string;
+    }
+  | {
+      /** Switch top-level view between 2D plan, 3D scene, and Sim mode. */
+      kind: "set-view-mode";
+      viewMode: "2d" | "3d" | "sim";
+      threeDMode?: "orbit" | "walk";
     };
 
 const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
@@ -388,6 +400,19 @@ const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
+    name: "set_view_mode",
+    description:
+      "Switch the editor's top-level view. '2d' shows the floor-plan canvas (best for placing/moving devices and drawing walls). '3d' shows the extruded scene (best for visualizing coverage, walking the building, or showing camera POV). 'sim' runs the path simulator. When viewMode='3d', optionally set threeDMode to 'orbit' (default) or 'walk' (WASD walkthrough). Use this proactively — e.g. switch to 3D before showing a camera POV, switch to 2D before drawing many new devices.",
+    input_schema: {
+      type: "object",
+      properties: {
+        viewMode: { type: "string", enum: ["2d", "3d", "sim"] },
+        threeDMode: { type: "string", enum: ["orbit", "walk"] },
+      },
+      required: ["viewMode"],
+    },
+  },
+  {
     name: "update_quote_settings",
     description:
       "Update one or more fields on the project quote: rates (laborRate, cablingPerCamera, cablingPerReader, commissioningFee, markupPct, taxPct), metadata (clientName, projectLocation, preparedBy, brandColor, printFooter), or narrative (regionalNotes, benchmark, narrative). Only include fields you actually want to change.",
@@ -497,12 +522,32 @@ The 3D representation reuses the subtype's built-in mesh (dome shape,
 bullet shape, etc.) — the label tells the user it's the specific
 product. This is what "synthesizing a replica" means in practice.
 
-VIEW (UI navigation):
+VIEW (UI navigation — you control which view the user is looking at):
+  set_view_mode           switch the top-level view between '2d' (floor
+                          plan canvas — best for placing/moving devices,
+                          drawing walls), '3d' (extruded scene — best
+                          for showing coverage, room layout, camera
+                          angles), or 'sim' (path simulator).  When
+                          viewMode='3d' you can also set threeDMode to
+                          'orbit' (free-look, default) or 'walk' (WASD
+                          first-person walkthrough). Use this PROACTIVELY
+                          — e.g. switch to 3D before describing a
+                          coverage gap, switch to 2D before placing many
+                          devices, switch to walk to show the user what
+                          a corridor feels like at floor level.
+
   view_from_camera        flip the 3D scene into first-person POV from a
-                          specific camera. Use when the user asks "what
-                          does X see" / "show me X's view" / "POV that
-                          camera". Always also explain in text what they
-                          should look for.
+                          specific camera (auto-switches to 3D if you're
+                          in 2D). Use when the user asks "what does X
+                          see" / "show me X's view" / "POV that camera".
+                          Always also explain in text what they should
+                          look for.
+
+The current view + 3D submode are reported in the floor state. Both 2D
+and 3D render the same data — your edits show up in both. Annotations
+appear in 2D as sticky-note pills on the canvas and in 3D as floating
+billboards above their pin point, so commentary is visible regardless
+of which view the user is in.
 
 RESEARCH (server-side; results stream back as citations):
   web_search              search the web — use this when the user asks for
@@ -807,6 +852,16 @@ function formatFloorContext(body: ChatRequestBody): string {
       `Floor plan image: ${floor.imageWidth} × ${floor.imageHeight} px`,
     );
   }
+  if (floor.viewMode) {
+    let view = `View: ${floor.viewMode.toUpperCase()}`;
+    if (floor.viewMode === "3d" && floor.threeDMode) {
+      view += ` (${floor.threeDMode}`;
+      if (floor.threeDMode === "pov" && floor.cameraPovTargetId)
+        view += ` from ${floor.cameraPovTargetId}`;
+      view += ")";
+    }
+    lines.push(view);
+  }
 
   lines.push("");
   lines.push(`Walls (${floor.walls.length}):`);
@@ -1064,6 +1119,15 @@ function toolUseToOperation(
         typeof input.deviceId === "string" ? input.deviceId : "";
       if (!deviceId) return null;
       return { kind: "view-from-camera", deviceId };
+    }
+    case "set_view_mode": {
+      const viewMode = input.viewMode as "2d" | "3d" | "sim";
+      if (!["2d", "3d", "sim"].includes(viewMode)) return null;
+      const threeDMode =
+        input.threeDMode === "orbit" || input.threeDMode === "walk"
+          ? (input.threeDMode as "orbit" | "walk")
+          : undefined;
+      return { kind: "set-view-mode", viewMode, threeDMode };
     }
     case "update_quote_settings": {
       const op: ChatOperation = { kind: "update-quote-settings" };

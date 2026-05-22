@@ -211,6 +211,11 @@ export function AIChatPanel() {
       if (pos)
         pingAICursor({ x: pos.x, y: pos.y, label: "Showing POV", tone: "edit" });
       setStatus({ icon: "edit", label: "Switching to camera POV" });
+    } else if (op.kind === "set-view-mode") {
+      setStatus({
+        icon: "edit",
+        label: `Switching to ${op.viewMode.toUpperCase()}${op.threeDMode ? ` (${op.threeDMode})` : ""}`,
+      });
     }
   }
 
@@ -425,7 +430,7 @@ export function AIChatPanel() {
             e.preventDefault();
             send(input);
           }}
-          className="flex items-end gap-2 rounded-xl border border-border/70 bg-card px-2.5 py-1.5 shadow-[inset_0_1px_0_oklch(1_0_0/3%)] focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/15 transition-colors"
+          className="flex items-center gap-2 rounded-xl border border-border/70 bg-card px-2.5 py-1.5 shadow-[inset_0_1px_0_oklch(1_0_0/3%)] focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/15 transition-colors"
         >
           <textarea
             ref={inputRef}
@@ -761,7 +766,7 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
         <div className="min-w-0 flex-1 space-y-1.5">
           {msg.content && (
             <div className="rounded-2xl rounded-tl-sm border border-border/60 bg-card/60 px-2.5 py-1.5 text-[0.8rem] leading-relaxed text-foreground/90 whitespace-pre-wrap">
-              {msg.content}
+              {renderInlineMarkdown(msg.content)}
             </div>
           )}
           {msg.webSearches != null && msg.webSearches > 0 && (
@@ -792,18 +797,77 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
 
 function OperationChip({ op }: { op: ChatOperation }) {
   const text = describeOperation(op);
+  const fullText = fullOperationDescription(op);
   const { tone, Icon } = chipStyleFor(op);
   return (
     <span
+      title={fullText}
       className={cn(
-        "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[0.68rem] font-medium ring-1",
+        "inline-flex max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-[0.68rem] font-medium ring-1",
         tone,
       )}
     >
-      <Icon className="size-2.5" strokeWidth={2.4} />
-      {text}
+      <Icon className="size-2.5 shrink-0" strokeWidth={2.4} />
+      <span className="truncate">{text}</span>
     </span>
   );
+}
+
+/**
+ * Long-form description for an operation — used as the chip's `title`
+ * tooltip so the user can hover and read the whole annotation text,
+ * device id, etc. without us bloating the visible chip.
+ */
+function fullOperationDescription(op: ChatOperation): string {
+  switch (op.kind) {
+    case "add-annotation":
+      return `${op.annotationKind}: ${op.text}`;
+    case "update-device":
+      return JSON.stringify(op, null, 2);
+    case "add-quote-line-item":
+      return `Add ${op.quantity} × ${op.description} @ $${op.unitCost} (${op.category})`;
+    default:
+      return describeOperation(op);
+  }
+}
+
+/**
+ * Minimal inline-markdown renderer for assistant text. Handles the two
+ * formats Claude actually uses in this chat:
+ *   • **bold**   → <strong>
+ *   • `code`     → <code>
+ * Anything else passes through as plain text. Avoids pulling in a
+ * full markdown lib for what's effectively two regexes.
+ */
+function renderInlineMarkdown(input: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  // Match one of: **bold** | `code`
+  const re = /\*\*([^*\n][^*]*?)\*\*|`([^`\n]+?)`/g;
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input))) {
+    if (m.index > last) out.push(input.slice(last, m.index));
+    if (m[1] != null) {
+      out.push(
+        <strong key={key++} className="font-semibold">
+          {m[1]}
+        </strong>,
+      );
+    } else if (m[2] != null) {
+      out.push(
+        <code
+          key={key++}
+          className="rounded bg-foreground/[0.07] px-1 py-px font-mono text-[0.78em]"
+        >
+          {m[2]}
+        </code>,
+      );
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < input.length) out.push(input.slice(last));
+  return out;
 }
 
 /**
@@ -905,6 +969,11 @@ function chipStyleFor(op: ChatOperation): {
       return {
         tone: "bg-rose-500/12 text-rose-700 dark:text-rose-300 ring-rose-500/25",
         Icon: Eye,
+      };
+    case "set-view-mode":
+      return {
+        tone: "bg-foreground/[0.07] text-foreground/85 ring-foreground/15",
+        Icon: Sparkles,
       };
     default:
       return {

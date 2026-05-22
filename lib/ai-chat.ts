@@ -95,7 +95,12 @@ export type ChatOperation =
       benchmark?: string;
       narrative?: string;
     }
-  | { kind: "view-from-camera"; deviceId: string };
+  | { kind: "view-from-camera"; deviceId: string }
+  | {
+      kind: "set-view-mode";
+      viewMode: "2d" | "3d" | "sim";
+      threeDMode?: "orbit" | "walk";
+    };
 
 /** Streaming callbacks the UI subscribes to. */
 export interface ChatStreamHandlers {
@@ -208,6 +213,12 @@ export async function streamAIChat(args: {
   });
   const floorWithQuote = {
     ...summarizeFloorForChat(args.floor),
+    // Tell the agent which view the user is currently looking at so it
+    // can decide whether to switch (e.g. flip to 3D before showing a
+    // coverage gap, or back to 2D before mass-placing devices).
+    viewMode: store.viewMode,
+    threeDMode: store.threeDMode,
+    cameraPovTargetId: store.cameraPovTargetId ?? undefined,
     quote: {
       clientName: q.clientName,
       projectLocation: q.projectLocation,
@@ -510,6 +521,19 @@ export function applyChatOperation(floorId: string, op: ChatOperation): boolean 
       store.enterCameraPov(op.deviceId);
       return true;
     }
+    if (op.kind === "set-view-mode") {
+      // Switching INTO 3D from POV mode? Restore orbit so the user
+      // doesn't get stuck in the prior camera's POV.
+      if (op.viewMode !== "3d") {
+        // POV doesn't apply outside 3D — clear it.
+        if (store.cameraPovTargetId) store.exitCameraPov();
+      }
+      store.setViewMode(op.viewMode);
+      if (op.viewMode === "3d" && op.threeDMode) {
+        store.setThreeDMode(op.threeDMode);
+      }
+      return true;
+    }
     if (op.kind === "update-quote-settings") {
       const partial: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(op)) {
@@ -559,7 +583,10 @@ export function describeOperation(op: ChatOperation): string {
     case "set-floor-scale":
       return `↻ scale → ${op.scalePxPerMeter.toFixed(0)} px/m`;
     case "add-annotation":
-      return `${op.annotationKind} "${op.text.length > 40 ? op.text.slice(0, 40) + "…" : op.text}"`;
+      // Slightly longer truncation than before so most chip text reads
+      // intelligibly in the chip itself. Full text is available via the
+      // chip's `title` tooltip on hover.
+      return `${op.annotationKind}: ${op.text.length > 70 ? op.text.slice(0, 70) + "…" : op.text}`;
     case "remove-annotation":
       return `× note ${op.annotationId}`;
     case "add-quote-line-item":
@@ -568,6 +595,8 @@ export function describeOperation(op: ChatOperation): string {
       return `× quote line #${op.index + 1}`;
     case "view-from-camera":
       return `👁 POV ${op.deviceId}`;
+    case "set-view-mode":
+      return `→ ${op.viewMode.toUpperCase()}${op.threeDMode ? ` (${op.threeDMode})` : ""}`;
     case "update-quote-settings": {
       const bits: string[] = [];
       if (op.clientName) bits.push(`client "${op.clientName}"`);
