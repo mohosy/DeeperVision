@@ -13,6 +13,7 @@ import type {
   Floor,
   InstallStatus,
   ThreeDMode,
+  TimeOfDay,
   Vec2,
   ViewMode,
   Wall,
@@ -62,7 +63,13 @@ export function createDefaultDesign(id?: string): DesignDocument {
   };
 }
 
-export type Tool = "select" | "wall" | "calibrate" | "door";
+export type Tool =
+  | "select"
+  | "wall"
+  | "calibrate"
+  | "door"
+  | "correct-walls"
+  | "wire";
 
 export interface ViewTransform {
   scale: number;
@@ -85,12 +92,44 @@ interface DesignState {
   currentDesignId: string | null;
   viewMode: ViewMode;
   threeDMode: ThreeDMode;
+  /** Day / dusk / night lighting preset for the 3D scene. Transient — not
+   *  persisted, defaults to "day" on every load. */
+  timeOfDay: TimeOfDay;
   selectedDeviceId: string | null;
+  /** Currently-selected cable. Mutually exclusive with selectedDeviceId
+   *  so the properties panel can show one OR the other cleanly. */
+  selectedCableId: string | null;
   tool: Tool;
   showCoverage: boolean;
+  /** Render the auto-routed cable runs (camera/reader/AP → NVR/switch) as
+   *  L-shaped lines on the 2D canvas and as ceiling-routed cables in 3D. */
+  showCabling: boolean;
+  /** Whether the in-app tour overlay is currently running. Transient. */
+  tourActive: boolean;
+  /** Current step index when the tour is running. Transient. */
+  tourStep: number;
+  /** Whether the user has finished or skipped the tour at least once. Persisted
+   *  so we don't re-auto-launch it on every page load — they can still replay
+   *  it from the Project menu. */
+  tourSeen: boolean;
   viewTransform: ViewTransform;
   quoteSettings: QuoteSettings;
   aiSurveyOpen: boolean;
+  /** Last AI-Survey self-check result. Set after each survey runs; null
+   *  when no survey has been checked yet (or when the user dismisses the
+   *  banner). Pure UI/transient — not persisted. */
+  surveyCheck:
+    | {
+        overallConfidence: "high" | "medium" | "low";
+        summary: string;
+        issues: {
+          kind: string;
+          severity: "info" | "warning" | "critical";
+          description: string;
+        }[];
+        ranAt: number;
+      }
+    | null;
   aiAdvisorOpen: boolean;
   quoteOpen: boolean;
   visibility: VisibilityFilter;
@@ -137,11 +176,18 @@ interface DesignState {
 
   setViewMode(mode: ViewMode): void;
   setThreeDMode(mode: ThreeDMode): void;
+  setTimeOfDay(mode: TimeOfDay): void;
   selectDevice(deviceId: string | null): void;
+  selectCable(cableId: string | null): void;
   setTool(tool: Tool): void;
   toggleCoverage(): void;
+  toggleCabling(): void;
+  startTour(): void;
+  setTourStep(step: number): void;
+  finishTour(): void;
   setViewTransform(t: ViewTransform): void;
   setAISurveyOpen(open: boolean): void;
+  setSurveyCheck(check: DesignState["surveyCheck"]): void;
   setAIAdvisorOpen(open: boolean): void;
   setQuoteOpen(open: boolean): void;
   setWalkSpawnOverride(spawn: [number, number, number] | null): void;
@@ -183,14 +229,47 @@ interface DesignState {
   setActiveFloor(floorId: string): void;
   updateFloor(floorId: string, partial: Partial<Omit<Floor, "id">>): void;
 
-  addDevice(floorId: string, type: DeviceType, position: Vec2, catalogProduct?: CatalogProduct): Device;
+  addDevice(
+    floorId: string,
+    type: DeviceType,
+    position: Vec2,
+    catalogProduct?: CatalogProduct,
+    /** Optional pre-assigned id from the server (AI chat agent). When
+        omitted, a fresh uid is generated. */
+    externalId?: string,
+  ): Device;
   updateDevice(floorId: string, deviceId: string, partial: Partial<Device>): void;
   removeDevice(floorId: string, deviceId: string): void;
 
-  addWall(floorId: string, wall: Omit<Wall, "id">): void;
+  addFurniture(
+    floorId: string,
+    item: Omit<import("@/types/design").FurnitureItem, "id">,
+    externalId?: string,
+  ): import("@/types/design").FurnitureItem;
+  updateFurniture(
+    floorId: string,
+    id: string,
+    partial: Partial<import("@/types/design").FurnitureItem>,
+  ): void;
+  removeFurniture(floorId: string, id: string): void;
+  addWall(floorId: string, wall: Omit<Wall, "id">, externalId?: string): void;
   removeWall(floorId: string, wallId: string): void;
+  addCable(
+    floorId: string,
+    cable: Omit<import("@/types/design").Cable, "id">,
+    externalId?: string,
+  ): import("@/types/design").Cable;
+  updateCable(
+    floorId: string,
+    cableId: string,
+    partial: Partial<import("@/types/design").Cable>,
+  ): void;
+  removeCable(floorId: string, cableId: string): void;
+  /** Partial update for a single wall — used by the wall-correction tool
+   *  to drag endpoints without rebuilding the whole wall list. */
+  updateWall(floorId: string, wallId: string, partial: Partial<Wall>): void;
 
-  addDoor(floorId: string, door: Omit<Door, "id">): Door;
+  addDoor(floorId: string, door: Omit<Door, "id">, externalId?: string): Door;
   updateDoor(floorId: string, doorId: string, partial: Partial<Door>): void;
   removeDoor(floorId: string, doorId: string): void;
 
@@ -227,20 +306,27 @@ export const useDesignStore = create<DesignState>()(
       (set, get) => ({
         designs: {},
         currentDesignId: null,
-        viewMode: "2d",
+        viewMode: "3d",
         threeDMode: "orbit",
+        timeOfDay: "day",
         selectedDeviceId: null,
+        selectedCableId: null,
         tool: "select",
         showCoverage: true,
+        showCabling: true,
+        tourActive: false,
+        tourStep: 0,
+        tourSeen: false,
         viewTransform: { scale: 1, offset: { x: 0, y: 0 } },
         quoteSettings: DEFAULT_QUOTE_SETTINGS,
         aiSurveyOpen: false,
+        surveyCheck: null,
         aiAdvisorOpen: false,
         quoteOpen: false,
         visibility: DEFAULT_VISIBILITY,
         walkSpawnOverride: null,
         cameraPovTargetId: null,
-        rightTab: "properties",
+        rightTab: "ai",
         aiCursor: null,
 
         ensureDesign(id) {
@@ -292,8 +378,18 @@ export const useDesignStore = create<DesignState>()(
           set({ threeDMode: mode });
         },
 
+        setTimeOfDay(mode) {
+          set({ timeOfDay: mode });
+        },
+
         selectDevice(deviceId) {
-          set({ selectedDeviceId: deviceId });
+          // Selecting a device clears any cable selection so the
+          // properties panel doesn't show stale cable data.
+          set({ selectedDeviceId: deviceId, selectedCableId: null });
+        },
+
+        selectCable(cableId) {
+          set({ selectedCableId: cableId, selectedDeviceId: null });
         },
 
         setTool(tool) {
@@ -304,12 +400,34 @@ export const useDesignStore = create<DesignState>()(
           set((state) => ({ showCoverage: !state.showCoverage }));
         },
 
+        toggleCabling() {
+          set((state) => ({ showCabling: !state.showCabling }));
+        },
+
+        startTour() {
+          set({ tourActive: true, tourStep: 0 });
+        },
+
+        setTourStep(step) {
+          set({ tourStep: step });
+        },
+
+        finishTour() {
+          // Mark seen so we don't auto-start again. The user can still replay
+          // the tour from the Project menu.
+          set({ tourActive: false, tourStep: 0, tourSeen: true });
+        },
+
         setViewTransform(t) {
           set({ viewTransform: t });
         },
 
         setAISurveyOpen(open) {
           set({ aiSurveyOpen: open });
+        },
+
+        setSurveyCheck(check) {
+          set({ surveyCheck: check });
         },
 
         setAIAdvisorOpen(open) {
@@ -506,7 +624,7 @@ export const useDesignStore = create<DesignState>()(
           });
         },
 
-        addDevice(floorId, type, position, catalogProduct) {
+        addDevice(floorId, type, position, catalogProduct, externalId) {
           const base = defaultsFor(type);
           const override: Record<string, unknown> = {};
           if (catalogProduct) {
@@ -547,7 +665,7 @@ export const useDesignStore = create<DesignState>()(
           const newDevice: Device = {
             ...base,
             ...override,
-            id: uid("dev"),
+            id: externalId ?? uid("dev"),
             position,
           } as Device;
           set((state) => {
@@ -634,13 +752,100 @@ export const useDesignStore = create<DesignState>()(
           });
         },
 
-        addWall(floorId, wall) {
+        addFurniture(floorId, item, externalId) {
+          const newItem: import("@/types/design").FurnitureItem = {
+            ...item,
+            id: externalId ?? uid("furn"),
+          };
           set((state) => {
             const id = state.currentDesignId;
             if (!id) return state;
             const design = state.designs[id];
             if (!design) return state;
-            const newWall: Wall = { ...wall, id: uid("wall") };
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          furniture: [...(f.furniture ?? []), newItem],
+                        }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+          return newItem;
+        },
+
+        updateFurniture(floorId, id, partial) {
+          set((state) => {
+            const did = state.currentDesignId;
+            if (!did) return state;
+            const design = state.designs[did];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [did]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          furniture: (f.furniture ?? []).map((it) =>
+                            it.id === id ? { ...it, ...partial } : it,
+                          ),
+                        }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        removeFurniture(floorId, id) {
+          set((state) => {
+            const did = state.currentDesignId;
+            if (!did) return state;
+            const design = state.designs[did];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [did]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          furniture: (f.furniture ?? []).filter(
+                            (it) => it.id !== id,
+                          ),
+                        }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        addWall(floorId, wall, externalId) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            const newWall: Wall = { ...wall, id: externalId ?? uid("wall") };
             return {
               designs: {
                 ...state.designs,
@@ -650,6 +855,34 @@ export const useDesignStore = create<DesignState>()(
                     f.id === floorId
                       ? { ...f, walls: [...f.walls, newWall] }
                       : f
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        updateWall(floorId, wallId, partial) {
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          walls: f.walls.map((w) =>
+                            w.id === wallId ? { ...w, ...partial } : w,
+                          ),
+                        }
+                      : f,
                   ),
                   updatedAt: nowISO(),
                 },
@@ -681,8 +914,119 @@ export const useDesignStore = create<DesignState>()(
           });
         },
 
-        addDoor(floorId, door) {
-          const newDoor: Door = { ...door, id: uid("door") };
+        addCable(floorId, cable, externalId) {
+          // If no waypoints were specified, auto-route the cable along
+          // the wall perimeter (ceiling-tray style). This matches how
+          // real low-voltage installs are run — cables hug walls
+          // instead of cutting diagonally across rooms.
+          let resolvedWaypoints = cable.waypoints;
+          if (!resolvedWaypoints || resolvedWaypoints.length === 0) {
+            const state0 = get();
+            const did = state0.currentDesignId;
+            const design0 = did ? state0.designs[did] : null;
+            const floor = design0?.floors.find((f) => f.id === floorId);
+            const src = floor?.devices.find(
+              (d) => d.id === cable.sourceDeviceId,
+            );
+            const tgt = floor?.devices.find(
+              (d) => d.id === cable.targetDeviceId,
+            );
+            if (floor && src && tgt) {
+              // Lazy require avoids a circular import — cabling.ts imports
+              // floor types but doesn't depend on the store.
+              resolvedWaypoints = require("./cabling").autoRouteCableWaypoints(
+                src.position,
+                tgt.position,
+                floor.walls,
+              );
+            }
+          }
+          const newCable: import("@/types/design").Cable = {
+            ...cable,
+            waypoints: resolvedWaypoints ?? [],
+            id: externalId ?? uid("cable"),
+          };
+          set((state) => {
+            const id = state.currentDesignId;
+            if (!id) return state;
+            const design = state.designs[id];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [id]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? { ...f, cables: [...(f.cables ?? []), newCable] }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+          return newCable;
+        },
+
+        updateCable(floorId, cableId, partial) {
+          set((state) => {
+            const did = state.currentDesignId;
+            if (!did) return state;
+            const design = state.designs[did];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [did]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          cables: (f.cables ?? []).map((c) =>
+                            c.id === cableId ? { ...c, ...partial } : c,
+                          ),
+                        }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        removeCable(floorId, cableId) {
+          set((state) => {
+            const did = state.currentDesignId;
+            if (!did) return state;
+            const design = state.designs[did];
+            if (!design) return state;
+            return {
+              designs: {
+                ...state.designs,
+                [did]: {
+                  ...design,
+                  floors: design.floors.map((f) =>
+                    f.id === floorId
+                      ? {
+                          ...f,
+                          cables: (f.cables ?? []).filter(
+                            (c) => c.id !== cableId,
+                          ),
+                        }
+                      : f,
+                  ),
+                  updatedAt: nowISO(),
+                },
+              },
+            };
+          });
+        },
+
+        addDoor(floorId, door, externalId) {
+          const newDoor: Door = { ...door, id: externalId ?? uid("door") };
           set((state) => {
             const id = state.currentDesignId;
             if (!id) return state;
@@ -878,8 +1222,18 @@ export const useDesignStore = create<DesignState>()(
                 },
               },
               selectedDeviceId: null,
-              viewMode: "2d",
+              // Intentionally NOT overriding viewMode here — the user's
+              // current view should be respected. If they pressed "Try
+              // the demo" from the 3D empty state, they stay in 3D and
+              // immediately see the building extrude. If they were in
+              // 2D, the demo loads in 2D.
               viewTransform: { scale: 1, offset: { x: 0, y: 0 } },
+              // Always reset the 3D sub-mode to orbit on demo load so the
+              // user gets a clean overview of the building first — never
+              // dropped straight into walk or POV mode.
+              threeDMode: "orbit",
+              cameraPovTargetId: null,
+              walkSpawnOverride: null,
             };
           });
         },
@@ -888,6 +1242,25 @@ export const useDesignStore = create<DesignState>()(
         limit: 50,
         partialize: (state) => ({ designs: state.designs }),
         equality: (a, b) => a.designs === b.designs,
+        // Coalesce bursts of state changes into a single undo entry. The AI
+        // chat applies operations one-by-one as Claude streams them; without
+        // this, a 5-camera placement would be 5 undo steps. The leading-edge
+        // throttle saves history on the FIRST change in a burst (capturing
+        // the pre-burst state), then drops subsequent changes within the
+        // window. One Cmd-Z reverts the whole AI turn.
+        handleSet: (handleSet) => {
+          let lastSaveAt = 0;
+          const BURST_MS = 400;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return ((pastState: unknown, ...rest: unknown[]) => {
+            const now = Date.now();
+            if (now - lastSaveAt < BURST_MS) return;
+            lastSaveAt = now;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (handleSet as any)(pastState, ...rest);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          }) as any;
+        },
       }
     ),
     {
@@ -938,11 +1311,30 @@ export const useDesignStore = create<DesignState>()(
         designs: state.designs,
         currentDesignId: state.currentDesignId,
         viewMode: state.viewMode,
-        threeDMode: state.threeDMode,
+        // threeDMode intentionally NOT persisted — it's a transient sub-mode
+        // (orbit / walk / pov) that should always reset to "orbit" on reload.
+        // Persisting it means a refresh while in walk mode lands the user
+        // back in walk at a stale spawn, which also used to crash R3F.
         showCoverage: state.showCoverage,
+        showCabling: state.showCabling,
+        tourSeen: state.tourSeen,
         quoteSettings: state.quoteSettings,
         visibility: state.visibility,
       }),
+      // Anyone whose localStorage was written before threeDMode was removed
+      // from partialize still has `threeDMode: 'walk'` (or 'pov') stuck on
+      // disk. Force it back to orbit at rehydrate time so 3D always opens
+      // with an overview, never mid-walkthrough at a stale spawn.
+      merge: (persistedState, currentState) => {
+        const persisted = (persistedState as Partial<DesignState>) ?? {};
+        return {
+          ...currentState,
+          ...persisted,
+          threeDMode: "orbit",
+          cameraPovTargetId: null,
+          walkSpawnOverride: null,
+        };
+      },
     }
   )
 );

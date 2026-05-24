@@ -60,6 +60,23 @@ export function Actor3D() {
 
   const palette = useMemo(() => makePalette(PLAYER_BODY_HUE), []);
 
+  // Detection state for the outline color — subscribed so React re-renders
+  // and the Outlines components get fresh props when lock state changes.
+  // (Outline color is a render-time prop, not a runtime-mutable one.)
+  const detectCount = useSimStore((s) => s.detectingCameras.size);
+  const outline = useMemo(() => {
+    if (detectCount === 0)
+      return { color: OUTLINE_COLOR, thickness: 0.012, opacity: 0.55 };
+    if (detectCount === 1)
+      return { color: "#10b981", thickness: 0.022, opacity: 0.95 }; // emerald
+    return { color: "#ef4444", thickness: 0.028, opacity: 1 }; // alarm red
+  }, [detectCount]);
+
+  // Refs into the materials we recolor every frame based on detection state.
+  const footprintRef = useRef<THREE.MeshBasicMaterial>(null);
+  const auraRef = useRef<THREE.MeshBasicMaterial>(null);
+  const auraMeshRef = useRef<THREE.Mesh>(null);
+
   useFrame(({ clock }, delta) => {
     if (!floor || !group.current) return;
     const path = floor.simPath ?? [];
@@ -146,15 +163,65 @@ export function Actor3D() {
         dt
       );
     }
+
+    // Detection-state coloring on the footprint ring + outer aura.
+    //   0 cams   → cyan (blind)         — neutral subject indicator
+    //   1 cam    → emerald (tracked)    — single camera lock
+    //   ≥2 cams  → red, pulsing (alarm) — multiple coverage, full lock
+    const detectCount = useSimStore.getState().detectingCameras.size;
+    const footprintMat = footprintRef.current;
+    const auraMat = auraRef.current;
+    const auraMesh = auraMeshRef.current;
+    if (footprintMat && auraMat && auraMesh) {
+      if (!running || detectCount === 0) {
+        footprintMat.color.set(PLAYER_SHIRT_HUE);
+        footprintMat.opacity = 0.45;
+        auraMat.color.set("#0891B2");
+        auraMat.opacity = 0;
+        auraMesh.scale.setScalar(1);
+      } else if (detectCount === 1) {
+        footprintMat.color.set("#10b981"); // emerald-500
+        footprintMat.opacity = 0.7;
+        auraMat.color.set("#10b981");
+        auraMat.opacity = 0.18;
+        auraMesh.scale.setScalar(1 + Math.sin(tt * 4) * 0.05);
+      } else {
+        // 2+ cameras → alarm red, breathing
+        const pulse = 0.5 + 0.5 * Math.sin(tt * 7);
+        footprintMat.color.set("#ef4444");
+        footprintMat.opacity = 0.55 + pulse * 0.4;
+        auraMat.color.set("#ef4444");
+        auraMat.opacity = 0.18 + pulse * 0.18;
+        auraMesh.scale.setScalar(1.1 + pulse * 0.18);
+      }
+    }
   });
 
   return (
     <group ref={group}>
-      {/* Subtle cyan footprint so the subject reads from above without
-         alarm-coding them */}
+      {/* Outer aura — only visible while a camera is on the subject. Bigger
+          and brighter as more cameras lock on. Two-tier color: emerald for
+          single lock, alarm red for multi-cam. */}
+      <mesh
+        ref={auraMeshRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, 0.01, 0]}
+      >
+        <ringGeometry args={[0.48, 0.85, 48]} />
+        <meshBasicMaterial
+          ref={auraRef}
+          color="#0891B2"
+          transparent
+          opacity={0}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* Inner footprint — the always-on subject locator. Color recolored
+          every frame by the useFrame callback above. */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.015, 0]}>
         <ringGeometry args={[0.34, 0.46, 40]} />
         <meshBasicMaterial
+          ref={footprintRef}
           color={PLAYER_SHIRT_HUE}
           transparent
           opacity={0.45}
@@ -172,6 +239,12 @@ export function Actor3D() {
           castShadow
         >
           <meshStandardMaterial color={PLAYER_PANTS_HUE} roughness={0.82} />
+          <Outlines
+            thickness={outline.thickness}
+            color={outline.color}
+            opacity={outline.opacity}
+            transparent
+          />
         </RoundedBox>
       </group>
       <group ref={legRRef} position={[0.11, 0.22, 0]}>
@@ -183,6 +256,12 @@ export function Actor3D() {
           castShadow
         >
           <meshStandardMaterial color={PLAYER_PANTS_HUE} roughness={0.82} />
+          <Outlines
+            thickness={outline.thickness}
+            color={outline.color}
+            opacity={outline.opacity}
+            transparent
+          />
         </RoundedBox>
       </group>
 
@@ -191,9 +270,9 @@ export function Actor3D() {
         <RoundedBox args={[0.44, 0.52, 0.36]} radius={0.07} smoothness={5} castShadow>
           <meshStandardMaterial color={PLAYER_SHIRT_HUE} roughness={0.62} />
           <Outlines
-            thickness={0.012}
-            color={OUTLINE_COLOR}
-            opacity={0.55}
+            thickness={outline.thickness}
+            color={outline.color}
+            opacity={outline.opacity}
             transparent
           />
         </RoundedBox>
@@ -269,6 +348,12 @@ export function Actor3D() {
         <group ref={headRef} position={[0, 0.55, 0]}>
           <RoundedBox args={[0.62, 0.58, 0.5]} radius={0.13} smoothness={5} castShadow>
             <meshStandardMaterial color={palette.head} roughness={0.6} />
+            <Outlines
+              thickness={outline.thickness}
+              color={outline.color}
+              opacity={outline.opacity}
+              transparent
+            />
           </RoundedBox>
           {/* Cap crown */}
           <mesh position={[0, 0.34, 0.04]}>

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Circle,
+  Circle as KCircle,
   Group,
   Image as KImage,
   Layer,
@@ -15,13 +16,17 @@ import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import { toast } from "sonner";
 import { useActiveFloor, useDesignStore } from "@/lib/store";
-import type { DeviceType, Vec2 } from "@/types/design";
+import { useSimStore } from "@/lib/sim-store";
+import type { Cable, Device, DeviceType, FurnitureItem, Vec2, Wall } from "@/types/design";
+import { CABLE_COLORS, CABLE_LABELS } from "@/types/design";
 import { getProduct } from "@/lib/catalog";
 import { distance, screenToDesign, snapToNearestWall } from "@/lib/geometry";
 import { useImage } from "./useImage";
 import { DeviceShape } from "./DeviceShape";
 import { AICursorOverlay } from "./AICursorOverlay";
 import { AnnotationsLayer } from "./AnnotationsLayer";
+import { CablingLayer } from "./CablingLayer";
+import { planCabling } from "@/lib/cabling";
 
 interface Canvas2DStageProps {
   width: number;
@@ -44,6 +49,7 @@ export function Canvas2DStage({
   const tool = useDesignStore((s) => s.tool);
   const setTool = useDesignStore((s) => s.setTool);
   const showCoverage = useDesignStore((s) => s.showCoverage);
+  const showCabling = useDesignStore((s) => s.showCabling);
   const visibility = useDesignStore((s) => s.visibility);
   const selectedId = useDesignStore((s) => s.selectedDeviceId);
   const selectDevice = useDesignStore((s) => s.selectDevice);
@@ -51,11 +57,20 @@ export function Canvas2DStage({
   const updateDevice = useDesignStore((s) => s.updateDevice);
   const removeDevice = useDesignStore((s) => s.removeDevice);
   const addWall = useDesignStore((s) => s.addWall);
+  const updateWall = useDesignStore((s) => s.updateWall);
+  const updateFurniture = useDesignStore((s) => s.updateFurniture);
   const updateFloor = useDesignStore((s) => s.updateFloor);
+  const surveyCheck = useDesignStore((s) => s.surveyCheck);
+  const setSurveyCheck = useDesignStore((s) => s.setSurveyCheck);
   const viewTransform = useDesignStore((s) => s.viewTransform);
   const setViewTransform = useDesignStore((s) => s.setViewTransform);
 
   const planImage = useImage(floor?.planImage ?? null);
+
+  // Wall-correction mode UI state. The slider lets the user lift the
+  // traced walls off the floor-plan image so they can see misalignments.
+  const [imageOpacity, setImageOpacity] = useState(0.85);
+  const isCorrecting = tool === "correct-walls";
 
   // Wall drawing transient state
   const [wallPoints, setWallPoints] = useState<Vec2[]>([]);
@@ -67,9 +82,18 @@ export function Canvas2DStage({
     { a: Vec2; b: Vec2 } | null
   >(null);
 
-  // AI survey dialog open/close lives in the design store so it's reachable
-  // from anywhere (TopBar, empty state, etc.)
-  const setAISurveyOpen = useDesignStore((s) => s.setAISurveyOpen);
+  // Wire-tool transient state. Once the user clicks a source device,
+  // we hold the source id + any intermediate waypoints (added by
+  // Shift-click on empty canvas). Clicking a second device closes the
+  // cable. Esc cancels.
+  const [wireSourceId, setWireSourceId] = useState<string | null>(null);
+  const [wireWaypoints, setWireWaypoints] = useState<Vec2[]>([]);
+  const isWiring = tool === "wire";
+  const addCable = useDesignStore((s) => s.addCable);
+  const removeCable = useDesignStore((s) => s.removeCable);
+  const updateCable = useDesignStore((s) => s.updateCable);
+  const selectedCableId = useDesignStore((s) => s.selectedCableId);
+  const selectCable = useDesignStore((s) => s.selectCable);
 
   // Fit-on-load: when we load a floor or its image, center the content.
   useEffect(() => {
@@ -182,6 +206,16 @@ export function Canvas2DStage({
       return;
     }
 
+    if (tool === "wire" && wireSourceId) {
+      // Shift-click on empty canvas adds an intermediate waypoint to
+      // the in-progress cable. Without shift, the click is ignored —
+      // the cable closes only on a device click.
+      if (e.evt.shiftKey) {
+        setWireWaypoints((wp) => [...wp, point]);
+      }
+      return;
+    }
+
     if (tool === "door" && floor) {
       // Snap to the nearest wall: project the click onto each wall segment
       // and pick the closest one. If nothing is within range, drop the door
@@ -238,6 +272,9 @@ export function Canvas2DStage({
 
   function onStageMouseMove(e: KonvaEventObject<MouseEvent>) {
     if (tool === "wall" && wallPoints.length > 0) {
+      const p = getDesignPoint(e.evt.clientX, e.evt.clientY);
+      setPendingCursor(p);
+    } else if (tool === "wire" && wireSourceId) {
       const p = getDesignPoint(e.evt.clientX, e.evt.clientY);
       setPendingCursor(p);
     } else if (pendingCursor) {
@@ -302,7 +339,15 @@ export function Canvas2DStage({
         if (tool !== "select") setTool("select");
         setWallPoints([]);
         setCalibrationPoints([]);
+        setWireSourceId(null);
+        setWireWaypoints([]);
         selectDevice(null);
+      } else if (e.key === "x" || e.key === "X") {
+        setTool("wire");
+        toast.message("Wire tool", {
+          description:
+            "Click a source device, then a target device. Shift-click empty space to add a bend. Esc to cancel.",
+        });
       } else if (e.key === "Enter" && tool === "wall") {
         setWallPoints([]);
         setTool("select");
@@ -385,10 +430,64 @@ export function Canvas2DStage({
         }}
         aria-hidden="true"
       />
+
+      {/* Self-check banner. Appears in correct-walls mode when the AI
+          Survey has produced a check result. Pinned top-center, can be
+          dismissed (clears the check) — non-blocking so the user can
+          still drag walls while reading. */}
+      {isCorrecting && surveyCheck && (
+        <div className="pointer-events-auto absolute left-1/2 top-3 z-30 w-[min(90%,640px)] -translate-x-1/2">
+          <SurveyCheckBanner
+            confidence={surveyCheck.overallConfidence}
+            summary={surveyCheck.summary}
+            issues={surveyCheck.issues}
+            onDismiss={() => setSurveyCheck(null)}
+          />
+        </div>
+      )}
+
+      {/* Floating wall-correction control strip. Shows the opacity slider
+          for the floor-plan image (so you can dial down the walls / image
+          to spot misalignment) and a Done button to return to Select. */}
+      {isCorrecting && planImage && (
+        <div className="pointer-events-auto absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-xl border border-border bg-background/95 px-4 py-3 shadow-2xl backdrop-blur">
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2.5">
+              <span className="text-[0.72rem] font-medium uppercase tracking-[0.1em] text-muted-foreground">
+                Floor plan
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={Math.round(imageOpacity * 100)}
+                onChange={(e) =>
+                  setImageOpacity(Number(e.target.value) / 100)
+                }
+                className="h-1.5 w-44 cursor-pointer accent-amber-500"
+                aria-label="Floor plan image opacity"
+              />
+              <span className="w-10 text-right font-mono text-[0.72rem] tabular-nums text-muted-foreground">
+                {Math.round(imageOpacity * 100)}%
+              </span>
+            </div>
+            <div className="h-5 w-px bg-border" />
+            <span className="text-[0.7rem] text-muted-foreground">
+              Drag the yellow dots to align walls with the image
+            </span>
+            <button
+              type="button"
+              onClick={() => setTool("select")}
+              className="rounded-md bg-foreground px-3 py-1 text-[0.74rem] font-medium text-background hover:bg-foreground/85"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
       {!planImage && floor.devices.length === 0 && floor.walls.length === 0 && (
         <FloorPlanEmptyState
           onUpload={onRequestUpload}
-          onGenerateAI={() => setAISurveyOpen(true)}
           onLoadDemo={() => {
             useDesignStore.getState().loadDemo();
             toast.success("Demo office loaded", {
@@ -426,7 +525,11 @@ export function Canvas2DStage({
               image={planImage}
               x={0}
               y={0}
-              opacity={0.85}
+              // In correction mode the slider drives opacity (so the
+              // user can lift walls off the image). In normal mode the
+              // image is the primary visual reference, rendered fully
+              // opaque; walls draw as a thin colored overlay on top.
+              opacity={isCorrecting ? imageOpacity : 1}
               listening={false}
             />
           )}
@@ -434,8 +537,13 @@ export function Canvas2DStage({
           {/* Interior floor fill — warm cream rectangle inside the wall
               bounding box so the floor reads as a real interior surface
               (matching the 3D scene's cream floor) while the surrounding
-              grid stays a cool neutral. Drawn beneath walls. */}
-          {interiorBox && (
+              grid stays a cool neutral. Drawn beneath walls.
+              SUPPRESSED when:
+                • Correction mode is active (so the user can see the
+                  underlying floor-plan image at the chosen opacity), OR
+                • A floor-plan image has been uploaded (the image IS the
+                  floor representation; the cream fill would hide it). */}
+          {interiorBox && !isCorrecting && !planImage && (
             <Rect
               x={interiorBox.x}
               y={interiorBox.y}
@@ -447,16 +555,72 @@ export function Canvas2DStage({
             />
           )}
 
-          {/* Walls */}
+          {/* Walls — render style depends on context:
+              • Correction mode: thicker + dark for editability
+              • With uploaded image: high-contrast dark overlay so the
+                trace pops on top of the image
+              • Otherwise: standard slate stroke */}
           {floor.walls.map((wall) => (
             <Line
               key={wall.id}
               points={[wall.start.x, wall.start.y, wall.end.x, wall.end.y]}
-              stroke="#94a3b8"
-              strokeWidth={3}
+              stroke={
+                isCorrecting
+                  ? "#0f172a"
+                  : planImage
+                    ? "#1e3a8a"
+                    : "#94a3b8"
+              }
+              strokeWidth={isCorrecting ? 4 : planImage ? 2.5 : 3}
               lineCap="round"
-              opacity={0.85}
+              opacity={isCorrecting ? 0.95 : planImage ? 0.8 : 0.85}
               listening={false}
+            />
+          ))}
+
+          {/* Endpoint correction handles — only in correct-walls mode.
+              Each wall gets two draggable circles (start, end). On drag-
+              end, we (a) right-angle snap if the resulting wall is within
+              5° of horizontal/vertical, and (b) snap to any other wall
+              endpoint within 12px. Both heuristics greatly reduce manual
+              precision needed and match how integrators actually want to
+              align AI-traced walls to a floor plan. */}
+          {isCorrecting &&
+            floor.walls.flatMap((wall) => [
+              <WallEndpointHandle
+                key={`${wall.id}-start`}
+                wall={wall}
+                end="start"
+                allWalls={floor.walls}
+                onChange={(p) =>
+                  updateWall(floor.id, wall.id, { start: p })
+                }
+              />,
+              <WallEndpointHandle
+                key={`${wall.id}-end`}
+                wall={wall}
+                end="end"
+                allWalls={floor.walls}
+                onChange={(p) =>
+                  updateWall(floor.id, wall.id, { end: p })
+                }
+              />,
+            ])}
+
+          {/* Furniture — draggable rotated rectangles. Each piece is a
+              Group with a fill rect + a corner rotation handle so users
+              can re-arrange whatever the AI Survey places. */}
+          {(floor.furniture ?? []).map((item) => (
+            <FurnitureShape
+              key={item.id}
+              item={item}
+              scalePxPerMeter={scalePxPerMeter}
+              onMove={(p) =>
+                updateFurniture(floor.id, item.id, { position: p })
+              }
+              onRotate={(r) =>
+                updateFurniture(floor.id, item.id, { rotation: r })
+              }
             />
           ))}
 
@@ -557,6 +721,55 @@ export function Canvas2DStage({
             />
           )}
 
+          {/* Cable runs — drawn beneath devices so the L-bend lines read
+              as conduit on the floor. */}
+          {showCabling && (
+            <CablingLayer runs={planCabling(floor).runs} />
+          )}
+
+          {/* Manual / user-authored cables. Drawn on top of the auto-
+              route layer (when both are visible) so the integrator's
+              explicit choice reads as the source-of-truth. */}
+          {(floor.cables ?? []).map((cable) => (
+            <ManualCableShape
+              key={cable.id}
+              cable={cable}
+              devices={floor.devices}
+              scalePxPerMeter={scalePxPerMeter}
+              selected={cable.id === selectedCableId}
+              onSelect={() => selectCable(cable.id)}
+              onDelete={() => removeCable(floor.id, cable.id)}
+              onWaypointMove={(idx, p) => {
+                const next = cable.waypoints.map((w, i) =>
+                  i === idx ? p : w,
+                );
+                updateCable(floor.id, cable.id, { waypoints: next });
+              }}
+            />
+          ))}
+
+          {/* In-progress wire preview — a dashed line from source +
+              waypoints to the cursor while the user is mid-draw. */}
+          {isWiring && wireSourceId && (() => {
+            const src = floor.devices.find((d) => d.id === wireSourceId);
+            if (!src) return null;
+            const pts: number[] = [src.position.x, src.position.y];
+            for (const w of wireWaypoints) {
+              pts.push(w.x, w.y);
+            }
+            if (pendingCursor) pts.push(pendingCursor.x, pendingCursor.y);
+            return (
+              <Line
+                points={pts}
+                stroke="#2563eb"
+                strokeWidth={2}
+                dash={[8, 6]}
+                opacity={0.7}
+                listening={false}
+              />
+            );
+          })()}
+
           {/* Devices — filtered through layer visibility */}
           {floor.devices
             .filter(
@@ -572,7 +785,48 @@ export function Canvas2DStage({
                 selected={device.id === selectedId}
                 showCoverage={showCoverage}
                 walls={floor.walls}
-                onSelect={() => selectDevice(device.id)}
+                onSelect={() => {
+                  // Wire-tool: clicking a device either starts or
+                  // closes a cable. First click = source. Second click
+                  // (on a different device) = target → addCable + reset.
+                  if (isWiring) {
+                    if (!wireSourceId) {
+                      setWireSourceId(device.id);
+                      toast.message("Source set", {
+                        description:
+                          "Now click the target device. Shift-click empty space to add a bend.",
+                        duration: 3500,
+                      });
+                    } else if (device.id !== wireSourceId) {
+                      // Close cable from source → waypoints → this target.
+                      const sourceDev = floor.devices.find(
+                        (d) => d.id === wireSourceId,
+                      );
+                      // Auto-pick cable type from source-device type —
+                      // matches the rule-of-thumb integrator chooses.
+                      const cableType: import("@/types/design").CableType =
+                        sourceDev?.type === "camera" ||
+                        (sourceDev?.type === "network" &&
+                          (sourceDev as Extract<Device, { type: "network" }>)
+                            .networkType === "access-point")
+                          ? "cat6"
+                          : sourceDev?.type === "reader"
+                            ? "22-4"
+                            : "18-2";
+                      addCable(floor.id, {
+                        sourceDeviceId: wireSourceId,
+                        targetDeviceId: device.id,
+                        type: cableType,
+                        waypoints: wireWaypoints,
+                      });
+                      setWireSourceId(null);
+                      setWireWaypoints([]);
+                      toast.success("Cable added");
+                    }
+                    return;
+                  }
+                  selectDevice(device.id);
+                }}
                 onMove={(x, y) =>
                   updateDevice(floor.id, device.id, { position: { x, y } })
                 }
@@ -625,11 +879,9 @@ export function Canvas2DStage({
 function FloorPlanEmptyState({
   onUpload,
   onLoadDemo,
-  onGenerateAI,
 }: {
   onUpload: () => void;
   onLoadDemo: () => void;
-  onGenerateAI: () => void;
 }) {
   return (
     <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
@@ -683,23 +935,35 @@ function FloorPlanEmptyState({
         />
       </svg>
 
-      {/* Content — no card border, just confident typography + actions */}
-      <div className="pointer-events-auto relative flex max-w-md flex-col items-center gap-7 px-8 text-center">
-        <div className="space-y-3">
-          <div className="text-[1.35rem] font-semibold tracking-[-0.02em] text-foreground">
-            Your canvas is ready
-          </div>
-          <div className="mx-auto max-w-[22rem] text-[0.92rem] leading-[1.55] text-muted-foreground">
-            Let AI design from a floor plan, draw walls yourself, or open the
-            demo office to see a finished design.
-          </div>
+      {/* Content — clean heading + two equal-weight CTAs. */}
+      <div className="pointer-events-auto relative flex max-w-md flex-col items-center gap-6 px-8 text-center">
+        <div className="text-[1.35rem] font-semibold tracking-[-0.02em] text-foreground">
+          Your canvas is ready
         </div>
-        <div className="flex flex-col items-center gap-2.5">
-          {/* Primary CTA — the killer feature */}
+        <div className="flex items-center gap-2.5">
           <button
             type="button"
-            onClick={onGenerateAI}
-            className="inline-flex h-11 items-center gap-2 rounded-full bg-primary px-6 text-[0.92rem] font-medium text-primary-foreground btn-lift shadow-[0_10px_28px_-10px_oklch(0.55_0.17_245/55%)] hover:bg-primary/90"
+            onClick={onUpload}
+            className="inline-flex h-11 items-center gap-2 rounded-full border border-border bg-card px-5 text-[0.92rem] font-medium text-foreground btn-lift hover:bg-foreground/[0.04]"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="size-4"
+              aria-hidden="true"
+            >
+              <path d="M12 5v14M5 12l7-7 7 7" />
+            </svg>
+            Upload plan
+          </button>
+          <button
+            type="button"
+            onClick={onLoadDemo}
+            className="inline-flex h-11 items-center gap-2 rounded-full bg-primary px-5 text-[0.92rem] font-medium text-primary-foreground btn-lift shadow-[0_10px_28px_-10px_oklch(0.55_0.17_245/55%)] hover:bg-primary/90"
           >
             <svg
               viewBox="0 0 24 24"
@@ -709,42 +973,8 @@ function FloorPlanEmptyState({
             >
               <path d="M12 2l2.39 5.69L20 8.59l-4 4.13.96 5.78L12 15.77 7.04 18.5 8 12.72l-4-4.13 5.61-.9L12 2z" />
             </svg>
-            Generate with AI
+            Try demo
           </button>
-          {/* Secondary actions */}
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={onUpload}
-              className="inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-[0.8rem] font-medium text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={1.8}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="size-3.5"
-              >
-                <path d="M12 5v14M5 12l7-7 7 7" />
-              </svg>
-              Upload plan
-            </button>
-            <span className="text-muted-foreground/40" aria-hidden="true">
-              ·
-            </span>
-            <button
-              type="button"
-              onClick={onLoadDemo}
-              className="inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-[0.8rem] font-medium text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
-            >
-              Try the demo
-            </button>
-          </div>
-        </div>
-        <div className="mt-1 text-[0.72rem] text-muted-foreground/70">
-          You can also drag a device from the library to start with.
         </div>
       </div>
     </div>
@@ -817,4 +1047,527 @@ function CalibrationPrompt({
 function useStateLocal(initial: string) {
   const [v, setV] = useState(initial);
   return [v, setV] as const;
+}
+
+/**
+ * Draggable circle on a wall endpoint. Snaps to:
+ *   1. Another wall's endpoint within 12px (so two walls join cleanly).
+ *   2. Horizontal / vertical if the resulting wall is within 5° of
+ *      orthogonal (since most real floor plans are right-angled).
+ *
+ * Calls `onChange` with the snapped position on each drag-move so the
+ * line and the handle stay in lockstep visually.
+ */
+function WallEndpointHandle({
+  wall,
+  end,
+  allWalls,
+  onChange,
+}: {
+  wall: Wall;
+  end: "start" | "end";
+  allWalls: Wall[];
+  onChange: (p: Vec2) => void;
+}) {
+  const pos = end === "start" ? wall.start : wall.end;
+  const otherEnd = end === "start" ? wall.end : wall.start;
+
+  function snap(p: Vec2): Vec2 {
+    // 1) Snap to another wall's endpoint if close enough.
+    const SNAP_PX = 12;
+    let best: Vec2 | null = null;
+    let bestDist = SNAP_PX;
+    for (const w of allWalls) {
+      if (w.id === wall.id) continue;
+      for (const ep of [w.start, w.end]) {
+        const d = Math.hypot(ep.x - p.x, ep.y - p.y);
+        if (d < bestDist) {
+          best = ep;
+          bestDist = d;
+        }
+      }
+    }
+    if (best) return { x: best.x, y: best.y };
+
+    // 2) Right-angle snap. Project the new wall onto horizontal /
+    // vertical if it's within ~5° of either.
+    const dx = p.x - otherEnd.x;
+    const dy = p.y - otherEnd.y;
+    const angle = Math.atan2(dy, dx);
+    const TOL = (5 * Math.PI) / 180;
+    const closest = [0, Math.PI / 2, Math.PI, -Math.PI / 2, -Math.PI].reduce(
+      (acc, target) => {
+        const diff = Math.abs(angularDiff(angle, target));
+        return diff < acc.diff ? { target, diff } : acc;
+      },
+      { target: angle, diff: Infinity },
+    );
+    if (closest.diff < TOL) {
+      const len = Math.hypot(dx, dy);
+      return {
+        x: otherEnd.x + Math.cos(closest.target) * len,
+        y: otherEnd.y + Math.sin(closest.target) * len,
+      };
+    }
+
+    return p;
+  }
+
+  return (
+    <KCircle
+      x={pos.x}
+      y={pos.y}
+      radius={7}
+      fill="#fbbf24"
+      stroke="#0f172a"
+      strokeWidth={1.5}
+      shadowColor="#0f172a"
+      shadowBlur={4}
+      shadowOpacity={0.4}
+      draggable
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "grab";
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "default";
+      }}
+      onDragMove={(e) => {
+        const p = snap({ x: e.target.x(), y: e.target.y() });
+        // Keep the handle visually pinned to the snap result.
+        e.target.x(p.x);
+        e.target.y(p.y);
+        onChange(p);
+      }}
+      onDragEnd={(e) => {
+        const p = snap({ x: e.target.x(), y: e.target.y() });
+        e.target.x(p.x);
+        e.target.y(p.y);
+        onChange(p);
+      }}
+    />
+  );
+}
+
+/** Color-coded fills / strokes for furniture rectangles in 2D plan view. */
+const FURNITURE_FILL: Record<string, string> = {
+  desk: "#fde68a",
+  chair: "#a7f3d0",
+  "conference-table": "#bae6fd",
+  "kitchen-island": "#fbcfe8",
+  sofa: "#ddd6fe",
+  toilet: "#e0f2fe",
+  sink: "#cffafe",
+  refrigerator: "#e2e8f0",
+  bed: "#fed7aa",
+  bookshelf: "#fef3c7",
+  "tv-display": "#cbd5e1",
+};
+const FURNITURE_STROKE: Record<string, string> = {
+  desk: "#b45309",
+  chair: "#047857",
+  "conference-table": "#0369a1",
+  "kitchen-island": "#9d174d",
+  sofa: "#5b21b6",
+  toilet: "#0369a1",
+  sink: "#0e7490",
+  refrigerator: "#475569",
+  bed: "#c2410c",
+  bookshelf: "#a16207",
+  "tv-display": "#0f172a",
+};
+
+/**
+ * Furniture footprint on the 2D plan, with drag-to-move + a corner
+ * rotation handle. Dragging the body moves the center; dragging the
+ * small chevron handle at the long-axis end rotates around the center.
+ */
+function FurnitureShape({
+  item,
+  scalePxPerMeter,
+  onMove,
+  onRotate,
+}: {
+  item: FurnitureItem;
+  scalePxPerMeter: number;
+  onMove: (p: Vec2) => void;
+  onRotate: (r: number) => void;
+}) {
+  const lPx = item.lengthM * scalePxPerMeter;
+  const wPx = item.widthM * scalePxPerMeter;
+  return (
+    <Group
+      x={item.position.x}
+      y={item.position.y}
+      rotation={(item.rotation * 180) / Math.PI}
+      draggable
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "grab";
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "default";
+      }}
+      onDragEnd={(e) => {
+        onMove({ x: e.target.x(), y: e.target.y() });
+      }}
+    >
+      {/* Body fill */}
+      <Rect
+        x={-lPx / 2}
+        y={-wPx / 2}
+        width={lPx}
+        height={wPx}
+        fill={FURNITURE_FILL[item.type]}
+        stroke={FURNITURE_STROKE[item.type]}
+        strokeWidth={1.5}
+        cornerRadius={4}
+        opacity={0.7}
+      />
+      {/* Tiny label dot on the long-axis "front" so orientation is
+          obvious at a glance — the arrow at +X tells you which way the
+          piece is facing in the 3D scene. */}
+      <Line
+        points={[
+          lPx / 2 - 6,
+          0,
+          lPx / 2 - 14,
+          -5,
+          lPx / 2 - 14,
+          5,
+        ]}
+        closed
+        fill={FURNITURE_STROKE[item.type]}
+        listening={false}
+      />
+      {/* Rotation handle — small circle ~10px past the front of the
+          piece, draggable independently of the body. */}
+      <FurnitureRotateHandle
+        x={lPx / 2 + 14}
+        y={0}
+        onRotate={(localAngle) => onRotate(item.rotation + localAngle)}
+      />
+    </Group>
+  );
+}
+
+function FurnitureRotateHandle({
+  x,
+  y,
+  onRotate,
+}: {
+  x: number;
+  y: number;
+  onRotate: (deltaRadians: number) => void;
+}) {
+  return (
+    <Group x={x} y={y}>
+      <Circle
+        radius={6}
+        fill="#fbbf24"
+        stroke="#0f172a"
+        strokeWidth={1.2}
+        draggable
+        onMouseEnter={(e) => {
+          const stage = e.target.getStage();
+          if (stage) stage.container().style.cursor = "ew-resize";
+        }}
+        onMouseLeave={(e) => {
+          const stage = e.target.getStage();
+          if (stage) stage.container().style.cursor = "default";
+        }}
+        onDragMove={(e) => {
+          // dx/dy from the original handle position → angle delta
+          // around the piece's local origin (the parent Group's 0,0).
+          const dx = e.target.x();
+          const dy = e.target.y();
+          const angle = Math.atan2(dy, dx);
+          onRotate(angle);
+          // Snap the handle back to its anchor so the user can keep
+          // dragging incrementally; parent re-renders with new rotation.
+          e.target.x(0);
+          e.target.y(0);
+        }}
+        onDragEnd={(e) => {
+          e.target.x(0);
+          e.target.y(0);
+        }}
+      />
+    </Group>
+  );
+}
+
+/**
+ * Manually-authored cable run between two devices. Color-coded by type,
+ * length-labeled, click to delete. Polyline goes source → waypoints →
+ * target so users can route around obstacles.
+ */
+function ManualCableShape({
+  cable,
+  devices,
+  scalePxPerMeter,
+  selected,
+  onSelect,
+  onDelete,
+  onWaypointMove,
+}: {
+  cable: Cable;
+  devices: Device[];
+  scalePxPerMeter: number;
+  selected: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+  onWaypointMove: (index: number, p: Vec2) => void;
+}) {
+  // Sim-mode glow pulse — when running, the cable shadow + opacity
+  // oscillate so it reads as "current is flowing" rather than dead
+  // copper. Pure cosmetic, low CPU (one timer per cable).
+  const simRunning = useSimStore((s) => s.running);
+  const [pulsePhase, setPulsePhase] = useState(0);
+  useEffect(() => {
+    if (!simRunning) return;
+    const id = window.setInterval(() => {
+      setPulsePhase((p) => (p + 0.18) % (Math.PI * 2));
+    }, 80);
+    return () => window.clearInterval(id);
+  }, [simRunning]);
+  const cableOpacity = simRunning
+    ? 0.7 + Math.sin(pulsePhase) * 0.25
+    : 0.85;
+
+  const src = devices.find((d) => d.id === cable.sourceDeviceId);
+  const tgt = devices.find((d) => d.id === cable.targetDeviceId);
+  if (!src || !tgt) return null;
+  const color = cable.color ?? CABLE_COLORS[cable.type];
+  const label = cable.label ?? CABLE_LABELS[cable.type];
+
+  // Flat polyline points: src → waypoints → tgt
+  const points: number[] = [src.position.x, src.position.y];
+  for (const w of cable.waypoints) points.push(w.x, w.y);
+  points.push(tgt.position.x, tgt.position.y);
+
+  // Cable length in meters, summed over all segments.
+  let lenPx = 0;
+  for (let i = 0; i < points.length - 2; i += 2) {
+    const dx = points[i + 2] - points[i];
+    const dy = points[i + 3] - points[i + 1];
+    lenPx += Math.hypot(dx, dy);
+  }
+  const lenM = lenPx / scalePxPerMeter;
+
+  // Midpoint of the longest segment for the label anchor.
+  let bestIdx = 0;
+  let bestLen = 0;
+  for (let i = 0; i < points.length - 2; i += 2) {
+    const dx = points[i + 2] - points[i];
+    const dy = points[i + 3] - points[i + 1];
+    const seg = Math.hypot(dx, dy);
+    if (seg > bestLen) {
+      bestLen = seg;
+      bestIdx = i;
+    }
+  }
+  const midX = (points[bestIdx] + points[bestIdx + 2]) / 2;
+  const midY = (points[bestIdx + 1] + points[bestIdx + 3]) / 2;
+
+  return (
+    <Group
+      onClick={(e) => {
+        e.cancelBubble = true;
+        // Shift-click quickly deletes; plain click selects + opens the
+        // properties panel where the user can change type / color / notes.
+        if (e.evt.shiftKey) {
+          onDelete();
+        } else {
+          onSelect();
+        }
+      }}
+      onMouseEnter={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "pointer";
+      }}
+      onMouseLeave={(e) => {
+        const stage = e.target.getStage();
+        if (stage) stage.container().style.cursor = "default";
+      }}
+    >
+      {/* Wider invisible hit-target so the user doesn't need pixel-
+          precise aim to click the cable. */}
+      <Line
+        points={points}
+        stroke="transparent"
+        strokeWidth={14}
+      />
+      {/* The visible cable itself — thicker dashed line, pulses during
+          sim mode, brighter halo when selected so the user knows which
+          cable they're editing. */}
+      <Line
+        points={points}
+        stroke={color}
+        strokeWidth={selected ? 5 : 4}
+        lineCap="round"
+        lineJoin="round"
+        dash={[10, 6]}
+        opacity={cableOpacity}
+        shadowColor={selected ? "#3b82f6" : color}
+        shadowBlur={selected ? 14 : simRunning ? 12 : 0}
+        shadowOpacity={selected ? 0.9 : simRunning ? 0.85 : 0}
+        listening={false}
+      />
+      {/* Type + length label — small dark pill at the midpoint */}
+      <Group x={midX} y={midY} listening={false}>
+        <Rect
+          x={-44}
+          y={-9}
+          width={88}
+          height={18}
+          cornerRadius={9}
+          fill="#0f172a"
+          opacity={0.88}
+        />
+        <Text
+          text={`${label} · ${lenM.toFixed(1)} m`}
+          fontSize={9}
+          fontFamily="Inter, system-ui, sans-serif"
+          fontStyle="500"
+          fill="#f8fafc"
+          align="center"
+          width={88}
+          x={-44}
+          y={-4}
+          letterSpacing={-0.1}
+        />
+      </Group>
+      {/* Waypoint handles — draggable, so the integrator can reroute
+          a cable without redrawing. Slightly larger when not in sim so
+          they're easy to grab; smaller + dimmer during sim so they
+          don't compete with the glow. */}
+      {cable.waypoints.map((w, i) => (
+        <Circle
+          key={i}
+          x={w.x}
+          y={w.y}
+          radius={simRunning ? 4 : 6}
+          fill={color}
+          stroke="#0f172a"
+          strokeWidth={1.5}
+          shadowColor="#0f172a"
+          shadowBlur={3}
+          shadowOpacity={0.4}
+          draggable
+          onMouseEnter={(e) => {
+            const stage = e.target.getStage();
+            if (stage) stage.container().style.cursor = "grab";
+          }}
+          onMouseLeave={(e) => {
+            const stage = e.target.getStage();
+            if (stage) stage.container().style.cursor = "default";
+          }}
+          onDragEnd={(e) => {
+            onWaypointMove(i, { x: e.target.x(), y: e.target.y() });
+          }}
+        />
+      ))}
+    </Group>
+  );
+}
+
+/** Shortest signed angular difference between two angles in radians. */
+function angularDiff(a: number, b: number): number {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
+/**
+ * Self-check banner shown after the AI Survey. Surfaces the second-pass
+ * AI's assessment of whether the trace matches the floor plan — overall
+ * confidence chip + a short summary + an expandable list of concrete
+ * issues to act on.
+ */
+function SurveyCheckBanner({
+  confidence,
+  summary,
+  issues,
+  onDismiss,
+}: {
+  confidence: "high" | "medium" | "low";
+  summary: string;
+  issues: { kind: string; severity: "info" | "warning" | "critical"; description: string }[];
+  onDismiss: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const tone = confidence === "high"
+    ? { bg: "bg-emerald-50 dark:bg-emerald-950/40", border: "border-emerald-300/60", chip: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300", dot: "bg-emerald-500", label: "High confidence" }
+    : confidence === "medium"
+      ? { bg: "bg-amber-50 dark:bg-amber-950/40", border: "border-amber-300/60", chip: "bg-amber-500/20 text-amber-700 dark:text-amber-300", dot: "bg-amber-500", label: "Medium confidence" }
+      : { bg: "bg-rose-50 dark:bg-rose-950/40", border: "border-rose-300/60", chip: "bg-rose-500/20 text-rose-700 dark:text-rose-300", dot: "bg-rose-500", label: "Low confidence" };
+  return (
+    <div
+      className={`rounded-xl border ${tone.border} ${tone.bg} p-3 shadow-2xl backdrop-blur`}
+    >
+      <div className="flex items-start gap-3">
+        <div
+          className={`mt-0.5 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[0.62rem] font-semibold uppercase tracking-[0.08em] ${tone.chip}`}
+        >
+          <span className={`size-1.5 rounded-full ${tone.dot}`} />
+          {tone.label}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[0.82rem] font-medium leading-snug text-foreground">
+            AI self-check
+          </div>
+          <div className="mt-0.5 text-[0.74rem] leading-snug text-muted-foreground">
+            {summary}
+          </div>
+          {issues.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              className="mt-1.5 text-[0.7rem] font-medium text-foreground/70 hover:text-foreground"
+            >
+              {open ? "Hide" : "Show"} {issues.length} issue{issues.length === 1 ? "" : "s"}
+            </button>
+          )}
+          {open && issues.length > 0 && (
+            <ul className="mt-2 space-y-1.5 border-t border-foreground/10 pt-2">
+              {issues.map((issue, i) => (
+                <li
+                  key={i}
+                  className="flex items-start gap-2 text-[0.72rem] leading-snug"
+                >
+                  <span
+                    className={`mt-0.5 inline-flex shrink-0 rounded-sm px-1 py-px font-mono text-[0.58rem] font-bold uppercase tracking-wider ${
+                      issue.severity === "critical"
+                        ? "bg-rose-500/20 text-rose-700 dark:text-rose-300"
+                        : issue.severity === "warning"
+                          ? "bg-amber-500/20 text-amber-700 dark:text-amber-300"
+                          : "bg-foreground/10 text-foreground/70"
+                    }`}
+                  >
+                    {issue.severity}
+                  </span>
+                  <span className="text-foreground/85">{issue.description}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          className="shrink-0 rounded-md p-1 text-muted-foreground/70 hover:bg-foreground/[0.06] hover:text-foreground"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
 }

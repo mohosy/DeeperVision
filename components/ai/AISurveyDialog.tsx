@@ -4,8 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2, Sparkles, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { loadImageMeta, runAISurvey } from "@/lib/ai-survey";
+import {
+  loadImageMeta,
+  loadPdfPageThumbnails,
+  runAISurvey,
+  runAISurveyCheck,
+} from "@/lib/ai-survey";
 import { applySurveyToActiveFloor } from "@/lib/ai-apply";
+import { useDesignStore } from "@/lib/store";
 
 type Phase = "upload" | "configure" | "running" | "done";
 
@@ -29,6 +35,15 @@ export function AISurveyDialog({ open, onClose }: Props) {
   const [buildingType, setBuildingType] = useState("");
   const [projectNotes, setProjectNotes] = useState("");
   const [statusStepIndex, setStatusStepIndex] = useState(0);
+  // PDF state: when the user uploads a multi-page PDF we show a
+  // thumbnail picker so they can choose the actual plan page (vs. a
+  // title sheet or sheet index). For single-page PDFs we skip the
+  // picker and use page 1 directly.
+  const [pdfThumbnails, setPdfThumbnails] = useState<
+    { page: number; dataUrl: string; width: number; height: number }[] | null
+  >(null);
+  const [pdfPage, setPdfPage] = useState<number>(1);
+  const [pdfLoading, setPdfLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Cycle through status messages while the request is in-flight so the user
@@ -58,21 +73,57 @@ export function AISurveyDialog({ open, onClose }: Props) {
   // Reset state when the dialog closes
   useEffect(() => {
     if (!open) {
-      // Slight delay so the close animation doesn't flash empty state
       const t = window.setTimeout(() => {
         setPhase("upload");
         setFile(null);
         setImagePreview(null);
         setBuildingType("");
         setProjectNotes("");
+        setPdfThumbnails(null);
+        setPdfPage(1);
+        setPdfLoading(false);
       }, 200);
       return () => window.clearTimeout(t);
     }
   }, [open]);
 
-  function handleFileChosen(f: File | null) {
+  async function handleFileChosen(f: File | null) {
     if (!f) return;
     setFile(f);
+
+    const isPdf =
+      f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+    if (isPdf) {
+      // Render all pages to thumbnails so the user can pick the right
+      // one. Single-page PDFs skip the picker.
+      setPdfLoading(true);
+      setPdfThumbnails(null);
+      setPdfPage(1);
+      try {
+        const { totalPages, thumbnails } = await loadPdfPageThumbnails(f);
+        setPdfLoading(false);
+        if (totalPages === 1) {
+          // No picker needed — preview page 1 directly.
+          setImagePreview(thumbnails[0]?.dataUrl ?? null);
+          setPhase("configure");
+        } else {
+          setPdfThumbnails(thumbnails);
+          setImagePreview(thumbnails[0]?.dataUrl ?? null);
+          setPhase("configure");
+        }
+      } catch (err) {
+        setPdfLoading(false);
+        toast.error("Couldn't read PDF", {
+          description:
+            err instanceof Error
+              ? err.message
+              : "The file may be encrypted or malformed.",
+        });
+      }
+      return;
+    }
+
+    // Regular image path
     const reader = new FileReader();
     reader.onload = () => setImagePreview(String(reader.result));
     reader.readAsDataURL(f);
@@ -83,7 +134,7 @@ export function AISurveyDialog({ open, onClose }: Props) {
     if (!file) return;
     setPhase("running");
     try {
-      const meta = await loadImageMeta(file);
+      const meta = await loadImageMeta(file, { pdfPage });
       const survey = await runAISurvey({
         imageBase64: meta.base64,
         imageMediaType: meta.mediaType,
@@ -92,13 +143,49 @@ export function AISurveyDialog({ open, onClose }: Props) {
         buildingType: buildingType.trim() || undefined,
         projectNotes: projectNotes.trim() || undefined,
       });
-      const { wallsAdded } = applySurveyToActiveFloor(survey, meta.base64);
+      const { wallsAdded, furnitureAdded } = applySurveyToActiveFloor(survey, meta.base64);
       setPhase("done");
+      // Switch to 2D view + the wall-correction tool so the user can
+      // immediately verify the trace against the floor plan image and
+      // drag any misaligned endpoints into place.
+      useDesignStore.getState().setViewMode("2d");
+      useDesignStore.getState().setTool("correct-walls");
+      // Clear any stale check from a prior run so the banner only shows
+      // the result of THIS survey.
+      useDesignStore.getState().setSurveyCheck(null);
       toast.success("Walls traced", {
-        description: `Generated ${wallsAdded} wall${wallsAdded === 1 ? "" : "s"}. Drag devices from the library, or ask the AI chat to place them for you.`,
+        description:
+          `Generated ${wallsAdded} wall${wallsAdded === 1 ? "" : "s"}` +
+          (furnitureAdded > 0
+            ? ` and ${furnitureAdded} furniture piece${furnitureAdded === 1 ? "" : "s"}`
+            : "") +
+          `. Running self-check…`,
+        duration: 5000,
       });
-      // Auto-close after a brief moment so user can see the result
       window.setTimeout(() => onClose(), 1400);
+
+      // Self-check pass — runs in the background after the dialog
+      // closes. Result lands in the surveyCheck store slot, which the
+      // canvas banner subscribes to. Failure is silent (the trace still
+      // exists; the check is purely a safety net).
+      try {
+        const check = await runAISurveyCheck({
+          imageBase64: meta.base64,
+          imageMediaType: meta.mediaType,
+          imageWidth: meta.width,
+          imageHeight: meta.height,
+          scalePxPerMeter: survey.scalePxPerMeter,
+          walls: survey.walls,
+        });
+        useDesignStore.getState().setSurveyCheck({
+          overallConfidence: check.overallConfidence,
+          summary: check.summary,
+          issues: check.issues,
+          ranAt: Date.now(),
+        });
+      } catch (err) {
+        console.warn("AI Survey self-check failed:", err);
+      }
     } catch (err) {
       console.error(err);
       setPhase("configure");
@@ -154,21 +241,32 @@ export function AISurveyDialog({ open, onClose }: Props) {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="flex w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border bg-foreground/[0.02] py-10 transition-colors hover:bg-foreground/[0.04] hover:border-primary/40"
+              disabled={pdfLoading}
+              className={cn(
+                "flex w-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border bg-foreground/[0.02] py-10 transition-colors hover:bg-foreground/[0.04] hover:border-primary/40",
+                pdfLoading && "cursor-wait opacity-70",
+              )}
             >
               <div className="flex size-12 items-center justify-center rounded-full bg-foreground/[0.05]">
-                <UploadCloud
-                  className="size-5 text-muted-foreground"
-                  strokeWidth={1.6}
-                />
+                {pdfLoading ? (
+                  <Loader2
+                    className="size-5 text-muted-foreground animate-spin"
+                    strokeWidth={1.8}
+                  />
+                ) : (
+                  <UploadCloud
+                    className="size-5 text-muted-foreground"
+                    strokeWidth={1.6}
+                  />
+                )}
               </div>
               <div className="text-center">
                 <div className="text-[0.92rem] font-medium">
-                  Drop in a floor plan
+                  {pdfLoading ? "Reading PDF…" : "Drop in a floor plan"}
                 </div>
                 <div className="mt-0.5 text-[0.76rem] text-muted-foreground">
-                  PNG, JPG, or WebP. PDFs aren&rsquo;t supported yet — export
-                  the page as an image first.
+                  PNG, JPG, WebP, or PDF. Multi-page PDFs let you pick the
+                  sheet.
                 </div>
               </div>
             </button>
@@ -188,6 +286,8 @@ export function AISurveyDialog({ open, onClose }: Props) {
                   onClick={() => {
                     setFile(null);
                     setImagePreview(null);
+                    setPdfThumbnails(null);
+                    setPdfPage(1);
                     setPhase("upload");
                   }}
                   className="absolute right-2 top-2 inline-flex items-center gap-1 rounded-md bg-background/85 px-2 py-1 text-[0.72rem] text-muted-foreground backdrop-blur hover:text-foreground"
@@ -195,6 +295,58 @@ export function AISurveyDialog({ open, onClose }: Props) {
                   <X className="size-3" /> Change
                 </button>
               </div>
+
+              {/* Multi-page PDF picker — only shown when the upload was a
+                  PDF with more than one page. Lets the user select which
+                  sheet is the actual floor plan (vs. a title sheet). */}
+              {pdfThumbnails && pdfThumbnails.length > 1 && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[0.78rem] font-medium text-foreground/85">
+                      Pick the floor-plan page
+                    </label>
+                    <span className="text-[0.7rem] text-muted-foreground">
+                      Page {pdfPage} of {pdfThumbnails.length}
+                    </span>
+                  </div>
+                  <div className="flex gap-2 overflow-x-auto pb-1">
+                    {pdfThumbnails.map((t) => (
+                      <button
+                        key={t.page}
+                        type="button"
+                        onClick={() => {
+                          setPdfPage(t.page);
+                          setImagePreview(t.dataUrl);
+                        }}
+                        className={cn(
+                          "group relative shrink-0 overflow-hidden rounded-md ring-1 transition-all",
+                          pdfPage === t.page
+                            ? "ring-2 ring-primary shadow-md"
+                            : "ring-border hover:ring-foreground/40",
+                        )}
+                        aria-label={`Page ${t.page}`}
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={t.dataUrl}
+                          alt={`Page ${t.page}`}
+                          className="block h-24 w-auto bg-white"
+                        />
+                        <span
+                          className={cn(
+                            "absolute bottom-0 left-0 right-0 px-1.5 py-0.5 text-center text-[0.62rem] font-medium",
+                            pdfPage === t.page
+                              ? "bg-primary text-primary-foreground"
+                              : "bg-black/55 text-white",
+                          )}
+                        >
+                          {t.page}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-1.5">
                 <label className="text-[0.78rem] font-medium text-foreground/85">
@@ -309,7 +461,7 @@ export function AISurveyDialog({ open, onClose }: Props) {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/png,image/jpeg,image/webp,image/gif"
+          accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf"
           className="hidden"
           onChange={(e) => handleFileChosen(e.target.files?.[0] ?? null)}
         />

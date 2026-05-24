@@ -1,6 +1,6 @@
 "use client";
 
-import { Camera, KeyRound, Radar, Wifi } from "lucide-react";
+import { Camera, Cable, KeyRound, Radar, Wifi } from "lucide-react";
 import { useDesignStore } from "@/lib/store";
 import { useActiveFloor } from "@/lib/store";
 import { cn } from "@/lib/utils";
@@ -16,6 +16,8 @@ export function LayerToggles() {
   const visibility = useDesignStore((s) => s.visibility);
   const toggleType = useDesignStore((s) => s.toggleDeviceTypeVisible);
   const toggleStatus = useDesignStore((s) => s.toggleInstallStatusVisible);
+  const showCabling = useDesignStore((s) => s.showCabling);
+  const toggleCabling = useDesignStore((s) => s.toggleCabling);
   const floor = useActiveFloor();
 
   if (!floor) return null;
@@ -78,6 +80,33 @@ export function LayerToggles() {
             </button>
           );
         })}
+      </div>
+
+      {/* Cabling toggle — single pill, mirrors the visual language of the
+          category chips. Lives between category + status so the eye groups
+          it with "what's drawn on the canvas". */}
+      <div className="pointer-events-auto flex items-center rounded-full bg-background/65 p-0.5 backdrop-blur-xl ring-1 ring-black/[0.04] dark:ring-white/[0.05] shadow-[0_4px_18px_-10px_rgba(0,0,0,0.18)]">
+        <button
+          type="button"
+          onClick={toggleCabling}
+          title={`${showCabling ? "Hide" : "Show"} cable runs`}
+          className={cn(
+            "inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[0.74rem] font-medium transition-colors",
+            showCabling
+              ? "text-foreground"
+              : "text-muted-foreground/55 hover:text-muted-foreground",
+          )}
+        >
+          <span
+            className={cn(
+              "size-1.5 rounded-full transition-colors",
+              showCabling ? "bg-teal-500" : "bg-muted-foreground/40",
+            )}
+            aria-hidden="true"
+          />
+          <Cable className="size-3.5" strokeWidth={1.7} />
+          <span>Wiring</span>
+        </button>
       </div>
 
       {/* Status toggles */}

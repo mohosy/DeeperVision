@@ -1,0 +1,186 @@
+==============================================================================
+ DeeperVision — Sunday work log (2026-05-24)
+==============================================================================
+
+Live production URL: https://deeper-vision-self.vercel.app
+GitHub repo:         https://github.com/mohosy/DeeperVision   (public)
+
+------------------------------------------------------------------------------
+ What we shipped today (highest impact first)
+------------------------------------------------------------------------------
+
+1. LANDING PAGE OVERHAUL
+   - Tagline iterated twice until it stuck:
+       v0  "Design security systems the way you actually experience them"
+       v1  "Stop drawing floor plans. Start walking them."
+       v2  "Design buildings you can walk through."  <-- final, italic on "walk"
+   - Brand wordmark in the top-left now reads "DeeperVision AI" with a
+     gradient violet-fuchsia "AI" badge (in components/marketing/TopNav.tsx).
+   - "Open the editor" CTA replaced with a layered-glass button:
+       - frosted gradient base + brighter top highlight
+       - inset + drop shadows, primary-tinted on hover
+       - animated specular shimmer drifts across on hover
+   - Removed the pricing section from the bottom of the landing page entirely
+     (app/page.tsx no longer imports PricingSection).
+
+2. DEMO OFFICE — REAL FURNITURE & LIGHTING
+   - Added a lot more furniture in lib/demo-design.ts so the demo feels lived
+     in instead of empty rooms with cameras:
+       Conference  -> 8 chairs around the table, wall-mounted display
+       Break room  -> fridge + sink along the west wall
+       Reception   -> waiting-area sofa + brochure shelving
+       Open office -> 6 desk chairs, east-wall bookshelf, huddle sofa
+       Kitchen bar -> sink + fridge alongside the island
+       Server room -> documentation bookshelf
+       Lounge      -> 2 sofas, large wall-mounted TV, library bookshelf
+   - Fix pass after user feedback "bookshelves are in the middle of the room
+     and one TV is stuck in the middle of a door":
+       - Conference TV moved off the east wall (door is there) -> west wall
+       - Break-room bookshelf deleted (4x4m room too cramped)
+       - Reception bookshelf -> flush against west outer wall
+       - Open-office bookshelf -> flush against east wall
+       - Server-room bookshelf -> flush against west wall
+       - Lounge bookshelf -> flush against east wall
+       - Lounge TV pulled 12 px north -> flush against north wall
+
+3. CABLES THAT ACTUALLY LOOK LIKE CABLES
+   - lib/cabling.ts now exports autoRouteCableWaypoints() that routes a cable
+     along the floor's wall-bounding-box perimeter (inset ~0.6 m) instead of
+     cutting diagonally across rooms. Strategy:
+       - project src + tgt onto their nearest perimeter edge
+       - same edge   -> 2 waypoints
+       - diff edges  -> 3 waypoints (srcProj -> corner -> tgtProj)
+     Degenerate floors fall back to an L-bend.
+   - lib/store.ts addCable() now auto-invokes that router when the caller
+     supplies no waypoints. So when the AI calls add_cable, OR the user
+     drops a wire with the manual wire tool, cables hug walls by default.
+   - 3D cables in components/scene3d/Scene3DCanvas.tsx switched from a plain
+     LineBasicMaterial to LineDashedMaterial with computeLineDistances(), so
+     manual + AI-placed cables are dashed and obvious in 3D — matches the 2D
+     style.
+
+4. AI WIRING THAT PICKS THE RIGHT CABLE TYPE
+   - lib/ai-prompt/tools.ts now hands Claude a strict SOURCE -> cable-type
+     table so it never picks the wrong wire. Hard rules:
+         camera (any subtype)         -> cat6  (PoE+, <=100 m)
+         network / access-point       -> cat6
+         network / nvr                -> cat6  (uplink to switch)
+         switch <-> switch            -> cat6  (or fiber if >100 m)
+         reader (card or keypad)      -> 22-4  (Belden 5504UE)
+         reader (biometric)           -> 22-4
+         sensor / motion-pir          -> 22-4
+         sensor / glass-break         -> 22-4
+         sensor / door-contact        -> 22-4
+         sensor / smoke or heat       -> 18-2  (NFPA 72 fire-alarm circuit)
+         lock / electric-strike       -> 18-2
+         lock / mag-lock              -> 18-2  (or 16-2 if run > 30 m)
+         lock / exit-device           -> 18-2
+         intercom                     -> cat6 (IP) or 18-2 (analog)
+         speaker (paging/mass-notif)  -> speaker-16-2
+   - Plus a TARGET picker telling Claude which device each drop should
+     terminate at. The prompt explicitly calls "cat6 to a reader" a hard
+     error so the model can't drift.
+
+5. RIGHT-SIDE AI PANEL — UI/UX CLEANUP
+   User feedback: "too many horizontal thin grey lines." Counted ~10 grey
+   border lines stacking vertically. Cut down to 1 structural divider:
+     - Tab strip border softened from border/70 -> border/40
+     - "AI editor" subheader bar deleted entirely (the tab already labels it).
+       "Clear" moved to a floating ghost button in the chat list.
+     - InlineQuoteCard outer border -> primary-tinted ring + soft shadow
+     - InlineQuoteCard internal border-t (collapsed/expanded divider) deleted
+     - BoM table border + per-row dividers -> zebra-stripe rows
+     - Stat boxes (Hardware/Labor/Tax): border -> filled bg
+     - Composer top border deleted (bg tint carries separation)
+     - Composer input box: border -> soft ring + subtle shadow
+     - Assistant chat bubbles: border -> soft drop shadow + 4% inset outline
+     - Attached-image pill: border -> ring
+     - Suggestion chips: border -> ring
+
+6. SUGGESTION CHIP REDESIGN
+   The empty-state starter prompts ("Critique my layout", "Analyze coverage",
+   etc.) were just grey rounded rows. Rebuilt as tinted icon cards:
+     - Each chip has a per-category gradient icon box (amber, emerald, sky,
+       violet, indigo, teal, yellow, rose)
+     - Hover: chip lifts (-translate-y-px) + a colored glow halo matching
+       the chip's tint kicks in
+     - Trailing arrow (up-right for "action" chips that open UI, straight up
+       for prompt-fill chips) fades in on hover
+     - Icon box pops 1.08x on hover
+     - Removed em-dash from "Critique my current layout — what's missing?"
+       -> "Critique my layout. What's missing?"
+     - Removed hyphen from "front-door camera"
+     - More-ideas toggle now uses ChevronDown/Up icons instead of ▾/▴
+     - Empty-state Sparkles header icon got a pulsing glow + gradient bg
+
+------------------------------------------------------------------------------
+ Files touched today (notable ones only)
+------------------------------------------------------------------------------
+
+  app/page.tsx                              dropped <PricingSection/>
+  components/marketing/Hero.tsx             new tagline + glass CTA + cascade
+  components/marketing/TopNav.tsx           "DeeperVision AI" + gradient badge
+  components/ai/AIChatPanel.tsx             panel cleanup + chip redesign
+  components/ai/InlineQuoteCard.tsx         quote card de-bordered + zebra BoM
+  components/editor/RightSidebar.tsx        softer tab-strip divider
+  components/scene3d/Scene3DCanvas.tsx      dashed 3D cables
+  lib/cabling.ts                            autoRouteCableWaypoints()
+  lib/store.ts                              addCable() auto-routes by default
+  lib/ai-prompt/tools.ts                    strict cable-type rules
+  lib/demo-design.ts                        furniture + wall-flush fixes
+
+------------------------------------------------------------------------------
+ How to deploy (the auto-deploy memory)
+------------------------------------------------------------------------------
+
+After every batch of fixes:
+
+  1. From the repo root, type-check:
+       npx tsc --noEmit
+     (Must be silent. Any compile error blocks the deploy.)
+
+  2. Push to Vercel production:
+       npx vercel --prod --yes
+
+     - --prod   : target the production branch (not preview)
+     - --yes    : skip the "Set up and deploy?" interactive prompt
+                  (uses the existing project link in ./.vercel/project.json)
+
+  3. Vercel returns a deployment URL (per-commit) plus the stable alias
+     https://deeper-vision-self.vercel.app — that alias always points at
+     the latest production deployment, so share that one.
+
+  Environment:
+     - Package manager is pnpm (NOT npm — npm crashes on the .pnpm/
+       directory structure). For local installs use:  pnpm add <pkg>
+     - Next.js 16.2.6 with Turbopack. If Turbopack ever serves a stale
+       chunk after deleting imports, nuke and restart:
+           rm -rf .next  &&  pnpm dev
+     - Anthropic API key lives only in Vercel's project env vars as
+       ANTHROPIC_API_KEY (and locally in .vercel/.env.production.local
+       which is gitignored). Never hardcoded in source.
+
+------------------------------------------------------------------------------
+ GitHub
+------------------------------------------------------------------------------
+
+  Repo:        https://github.com/mohosy/DeeperVision
+  Visibility:  PUBLIC
+  Default:     main
+  Today's commit was pushed to origin/main with a co-authored Claude trailer.
+
+  API-key safety audit before pushing:
+     - .env*       -> already in .gitignore (line 34)
+     - .vercel/    -> already in .gitignore (line 37, where the prod
+                       env file actually lives locally)
+     - .claude/    -> added to .gitignore today (line 40)
+     - grepped all *.ts / *.tsx for hardcoded keys -> none found; every
+       AI route reads from process.env.ANTHROPIC_API_KEY only.
+
+  The Vercel project's env vars are managed via the Vercel dashboard at
+  vercel.com/mohosys-projects/deeper-vision/settings/environment-variables
+  — they are NOT in the git repo and never have been.
+
+==============================================================================
+ End of Sunday log.  Good run.
+==============================================================================

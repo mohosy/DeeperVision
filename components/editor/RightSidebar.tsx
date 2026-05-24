@@ -1,6 +1,6 @@
 "use client";
 
-import { Sparkles, SlidersHorizontal } from "lucide-react";
+import { PanelRightClose, Sparkles, SlidersHorizontal } from "lucide-react";
 import { useDesignStore } from "@/lib/store";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { AIChatPanel } from "@/components/ai/AIChatPanel";
@@ -18,34 +18,51 @@ import { cn } from "@/lib/utils";
  * Width is fixed at the parent level (currently w-80 in EditorShell);
  * both panels are responsible for fitting that width gracefully.
  */
-export function RightSidebar() {
+export function RightSidebar({
+  onCollapse,
+}: { onCollapse?: () => void } = {}) {
   const tab = useDesignStore((s) => s.rightTab);
   const setTab = useDesignStore((s) => s.setRightTab);
 
   return (
     <aside className="flex h-full w-full flex-col border-l border-border/70 bg-sidebar">
-      {/* Tab strip */}
-      <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-border/70 bg-background/30 px-1.5">
+      {/* Tab strip — the only structural divider in the panel. Kept
+          subtle (border/40) so it doesn't feel like a hard horizontal
+          line stacked under everything else below. */}
+      <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-border/40 bg-background/30 px-1.5">
         <TabButton
           active={tab === "properties"}
           onClick={() => setTab("properties")}
           icon={<SlidersHorizontal className="size-3.5" strokeWidth={1.9} />}
           label="Properties"
         />
-        <TabButton
-          active={tab === "ai"}
-          onClick={() => setTab("ai")}
-          icon={
-            <span className="relative inline-flex">
-              <Sparkles className="size-3.5 text-primary" strokeWidth={1.9} />
-              {tab !== "ai" && (
-                <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-primary animate-pulse" />
-              )}
-            </span>
-          }
-          label="AI"
-          accent
-        />
+        <span data-tour="ai-tab" className="inline-flex">
+          <TabButton
+            active={tab === "ai"}
+            onClick={() => setTab("ai")}
+            icon={
+              <span className="relative inline-flex">
+                <Sparkles className="size-3.5 text-primary" strokeWidth={1.9} />
+                {tab !== "ai" && (
+                  <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-primary animate-pulse" />
+                )}
+              </span>
+            }
+            label="AI"
+            accent
+          />
+        </span>
+        {onCollapse && (
+          <button
+            type="button"
+            onClick={onCollapse}
+            title="Collapse panel"
+            aria-label="Collapse panel"
+            className="ml-auto flex size-6 items-center justify-center rounded-md text-muted-foreground/70 hover:bg-foreground/[0.06] hover:text-foreground transition-colors"
+          >
+            <PanelRightClose className="size-3.5" strokeWidth={1.7} />
+          </button>
+        )}
       </div>
 
       <div className="min-h-0 flex-1">

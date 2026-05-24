@@ -66,10 +66,37 @@ import type {
 
 export type PreviewKind =
   | { type: "camera"; subtype: "dome" | "ptz" | "fixed" | "fisheye" }
-  | { type: "reader"; subtype: "card" | "biometric" | "keypad" }
+  | {
+      type: "reader";
+      subtype:
+        | "card"
+        | "biometric"
+        | "keypad"
+        | "electric-strike"
+        | "mag-lock"
+        | "rex-button"
+        | "exit-device"
+        | "intercom"
+        | "power-supply"
+        | "turnstile"
+        | "bollard"
+        | "gate-operator";
+    }
   | {
       type: "sensor";
-      subtype: "motion" | "glass-break" | "door-contact" | "smoke";
+      subtype:
+        | "motion"
+        | "glass-break"
+        | "door-contact"
+        | "smoke"
+        | "pull-station"
+        | "facp"
+        | "exit-sign"
+        | "aed"
+        | "back-box"
+        | "mount-bracket"
+        | "conduit"
+        | "raceway";
     }
   | { type: "network"; subtype: "switch" | "access-point" | "nvr" };
 
@@ -156,6 +183,131 @@ const LAYOUTS: Record<string, PreviewLayout> = {
     lookAt: [0, 0, 0],
     initialYaw: -0.2,
     scale: 1.9,
+    fov: 32,
+  },
+  // Door hardware — wall-mount devices share the reader's local frame,
+  // so the same hero-angle layout works for all of them with minor
+  // tweaks to scale.
+  "electric-strike": {
+    cameraPos: [0.7, 0.05, 0.55],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.2,
+    scale: 1.7,
+    fov: 32,
+  },
+  "mag-lock": {
+    cameraPos: [0.5, 0.4, 0.85],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.4,
+    scale: 1.3,
+    fov: 32,
+  },
+  "rex-button": {
+    cameraPos: [0.75, 0.1, 0.6],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.25,
+    scale: 2.6,
+    fov: 32,
+  },
+  "exit-device": {
+    cameraPos: [0.55, 0.45, 0.75],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.35,
+    scale: 0.95,
+    fov: 32,
+  },
+  intercom: {
+    cameraPos: [0.85, 0.05, 0.55],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.2,
+    scale: 1.7,
+    fov: 32,
+  },
+  "power-supply": {
+    cameraPos: [0.75, 0.2, 0.7],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.3,
+    scale: 1.3,
+    fov: 32,
+  },
+  // Perimeter
+  turnstile: {
+    cameraPos: [0.9, 0.5, 1.1],
+    lookAt: [0, -0.4, 0],
+    initialYaw: -0.55,
+    scale: 0.65,
+    fov: 32,
+  },
+  bollard: {
+    cameraPos: [0.6, 0.5, 0.9],
+    lookAt: [0, 0.3, 0],
+    initialYaw: 0,
+    scale: 0.95,
+    fov: 32,
+  },
+  "gate-operator": {
+    cameraPos: [0.7, 0.55, 1.1],
+    lookAt: [0.2, 0.3, 0],
+    initialYaw: -0.45,
+    scale: 1.0,
+    fov: 32,
+  },
+  // Fire / life safety
+  "pull-station": {
+    cameraPos: [0.85, 0.05, 0.55],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.25,
+    scale: 2.0,
+    fov: 32,
+  },
+  facp: {
+    cameraPos: [0.65, 0.15, 0.85],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.45,
+    scale: 1.1,
+    fov: 32,
+  },
+  "exit-sign": {
+    cameraPos: [0.55, 0.3, 0.95],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.4,
+    scale: 1.55,
+    fov: 32,
+  },
+  aed: {
+    cameraPos: [0.7, 0.2, 0.85],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.35,
+    scale: 1.3,
+    fov: 32,
+  },
+  // Install hardware
+  "back-box": {
+    cameraPos: [0.75, 0.15, 0.7],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.35,
+    scale: 3.0,
+    fov: 32,
+  },
+  "mount-bracket": {
+    cameraPos: [0.65, 0.3, 0.85],
+    lookAt: [0.08, 0, 0],
+    initialYaw: -0.35,
+    scale: 1.7,
+    fov: 32,
+  },
+  conduit: {
+    cameraPos: [0.55, 0.45, 0.85],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.5,
+    scale: 1.05,
+    fov: 32,
+  },
+  raceway: {
+    cameraPos: [0.55, 0.45, 0.85],
+    lookAt: [0, 0, 0],
+    initialYaw: -0.55,
+    scale: 1.0,
     fov: 32,
   },
   // Sensors

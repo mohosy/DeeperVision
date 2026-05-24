@@ -20,10 +20,35 @@ export interface SurveyProposedDevice {
   rationale: string;
 }
 
+export interface SurveyProposedFurniture {
+  type:
+    | "desk"
+    | "chair"
+    | "conference-table"
+    | "kitchen-island"
+    | "sofa"
+    | "toilet"
+    | "sink"
+    | "refrigerator"
+    | "bed"
+    | "bookshelf"
+    | "tv-display";
+  x: number;
+  y: number;
+  rotationDegrees: number;
+  lengthM: number;
+  widthM: number;
+  label?: string;
+  rationale?: string;
+}
+
 export interface SurveyResponse {
   scalePxPerMeter: number;
   walls: SurveyProposedWall[];
   devices: SurveyProposedDevice[];
+  /** Furniture detected in the image. Empty if the floor plan didn't
+   *  show any. */
+  furniture?: SurveyProposedFurniture[];
   summary: string;
   usage: { inputTokens: number; outputTokens: number };
 }
@@ -31,6 +56,13 @@ export interface SurveyResponse {
 /**
  * Read a File (from a file input) into a base64 data URL and capture its
  * dimensions.
+ *
+ * Accepts:
+ *  - PNG / JPEG / WebP / GIF — used directly
+ *  - PDF — first page (or `pdfPage` if specified, 1-based) is rendered
+ *    to a 2× canvas and converted to PNG. Floor plans distributed as
+ *    PDFs are the norm in commercial AEC workflows, so this is a
+ *    must-have ingest path.
  *
  * Large images (>1500 px on the long edge) are downscaled before
  * returning. We do this for TWO reasons:
@@ -49,12 +81,27 @@ export interface SurveyResponse {
  * The downscaled image is what we save as `planImage` AND what we send
  * to Claude, so coordinates and rendering stay aligned.
  */
-export async function loadImageMeta(file: File): Promise<{
+export async function loadImageMeta(
+  file: File,
+  options: { pdfPage?: number } = {},
+): Promise<{
   base64: string;
   mediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
   width: number;
   height: number;
 }> {
+  // PDF branch — render to PNG first, then fall through to the regular
+  // image processing path below.
+  const isPdf =
+    file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  if (isPdf) {
+    const png = await renderPdfPageToPng(file, options.pdfPage ?? 1);
+    // Wrap as a File so the rest of the pipeline can treat it normally.
+    file = new File([png.blob], file.name.replace(/\.pdf$/i, ".png"), {
+      type: "image/png",
+    });
+  }
+
   const allowed = ["image/png", "image/jpeg", "image/webp", "image/gif"];
   const mediaType = allowed.includes(file.type)
     ? (file.type as "image/png" | "image/jpeg" | "image/webp" | "image/gif")
@@ -144,4 +191,180 @@ export async function runAISurvey(args: {
     );
   }
   return (await res.json()) as SurveyResponse;
+}
+
+/**
+ * Self-check pass — sends the original image + the traced walls back to
+ * Claude for a "does this match?" review. Returns a structured assessment
+ * with a confidence level and concrete issues the user can act on. Runs
+ * after the main survey so the user sees both the trace and the review.
+ */
+
+export type SurveyCheckIssueKind =
+  | "missing-wall"
+  | "extra-wall"
+  | "misaligned"
+  | "scale-off"
+  | "scale-ok"
+  | "ok";
+
+export type SurveyCheckConfidence = "high" | "medium" | "low";
+
+export interface SurveyCheckIssue {
+  kind: SurveyCheckIssueKind;
+  severity: "info" | "warning" | "critical";
+  description: string;
+}
+
+export interface SurveyCheckResponse {
+  overallConfidence: SurveyCheckConfidence;
+  summary: string;
+  issues: SurveyCheckIssue[];
+  usage: { inputTokens: number; outputTokens: number };
+}
+
+export async function runAISurveyCheck(args: {
+  imageBase64: string;
+  imageMediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  imageWidth: number;
+  imageHeight: number;
+  scalePxPerMeter: number;
+  walls: SurveyProposedWall[];
+}): Promise<SurveyCheckResponse> {
+  const res = await fetch("/api/ai/survey-check", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      imageBase64: args.imageBase64,
+      imageMediaType: args.imageMediaType,
+      imageWidth: args.imageWidth,
+      imageHeight: args.imageHeight,
+      scalePxPerMeter: args.scalePxPerMeter,
+      walls: args.walls.map((w) => ({
+        startX: w.startX,
+        startY: w.startY,
+        endX: w.endX,
+        endY: w.endY,
+      })),
+    }),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(
+      (errBody as { error?: string })?.error ??
+        `Survey-check request failed (${res.status})`,
+    );
+  }
+  return (await res.json()) as SurveyCheckResponse;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PDF helpers
+// ─────────────────────────────────────────────────────────────────
+//
+// pdfjs-dist runs entirely in the browser. We use dynamic imports +
+// inline-worker so we don't have to ship a separate worker file or
+// configure Next's webpack/Turbopack worker pipeline.
+
+/**
+ * Inspect a PDF file and return its page count + a list of page
+ * thumbnails (data URLs) for a picker UI. Used by AISurveyDialog to
+ * show a thumbnail grid when the PDF has multiple pages, since floor
+ * plan PDFs often include title sheets / index pages and the user
+ * needs to pick the actual plan page.
+ */
+export async function loadPdfPageThumbnails(
+  file: File,
+  maxPages = 20,
+): Promise<{ totalPages: number; thumbnails: { page: number; dataUrl: string; width: number; height: number }[] }> {
+  const pdfjs = await loadPdfJs();
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjs.getDocument({ data: buf }).promise;
+  const totalPages = doc.numPages;
+  const thumbnails: {
+    page: number;
+    dataUrl: string;
+    width: number;
+    height: number;
+  }[] = [];
+  const pages = Math.min(totalPages, maxPages);
+  for (let i = 1; i <= pages; i++) {
+    const page = await doc.getPage(i);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const targetMax = 240;
+    const scale = Math.min(targetMax / Math.max(baseViewport.width, baseViewport.height), 1);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(viewport.width);
+    canvas.height = Math.floor(viewport.height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) continue;
+    await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+    thumbnails.push({
+      page: i,
+      dataUrl: canvas.toDataURL("image/png"),
+      width: canvas.width,
+      height: canvas.height,
+    });
+  }
+  return { totalPages, thumbnails };
+}
+
+/**
+ * Render a single page of a PDF to a high-res PNG blob suitable for
+ * feeding into loadImageMeta()'s normal image pipeline.
+ */
+async function renderPdfPageToPng(
+  file: File,
+  pageNumber: number,
+): Promise<{ blob: Blob; width: number; height: number }> {
+  const pdfjs = await loadPdfJs();
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjs.getDocument({ data: buf }).promise;
+  const safePage = Math.max(1, Math.min(pageNumber, doc.numPages));
+  const page = await doc.getPage(safePage);
+  // Render at 2× device-pixel scale so detail survives the subsequent
+  // 1500-px downscale Claude expects.
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Browser canvas unavailable for PDF render");
+  }
+  // White background — many architectural PDFs are line-only on
+  // transparent so without this they render with whatever's behind.
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))),
+      "image/png",
+    );
+  });
+  return { blob, width: canvas.width, height: canvas.height };
+}
+
+/**
+ * Lazy-load pdf.js + wire up the worker via Blob URL. Done once per
+ * tab and cached.
+ */
+let _pdfjsModulePromise:
+  | Promise<typeof import("pdfjs-dist")>
+  | null = null;
+function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
+  if (_pdfjsModulePromise) return _pdfjsModulePromise;
+  _pdfjsModulePromise = (async () => {
+    const pdfjs = await import("pdfjs-dist");
+    // Point at the worker via a CDN-mirrored URL. Using the package's
+    // own version means we can't accidentally pair mismatched
+    // worker/lib versions.
+    const version = pdfjs.version;
+    const workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${version}/build/pdf.worker.min.mjs`;
+    pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+    return pdfjs;
+  })();
+  return _pdfjsModulePromise;
 }

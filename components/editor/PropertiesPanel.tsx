@@ -14,12 +14,18 @@ import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
 import type {
   Annotation,
+  Cable,
+  CableType,
   CameraDevice,
   Device,
   DevicePhoto,
   Door,
+  DoorLock,
   InstallStatus,
+  LockFailMode,
+  LockType,
 } from "@/types/design";
+import { CABLE_COLORS, CABLE_LABELS } from "@/types/design";
 import { getProduct } from "@/lib/catalog";
 import { formatUSD } from "@/lib/pricing";
 import { DevicePhotoStrip } from "./DevicePhotoStrip";
@@ -32,6 +38,7 @@ function pickValue(v: number | readonly number[]): number {
 
 export function PropertiesPanel() {
   const selectedId = useDesignStore((s) => s.selectedDeviceId);
+  const selectedCableId = useDesignStore((s) => s.selectedCableId);
   const floor = useActiveFloor();
   const design = useCurrentDesign();
   const updateDevice = useDesignStore((s) => s.updateDevice);
@@ -41,6 +48,13 @@ export function PropertiesPanel() {
   const removeDoor = useDesignStore((s) => s.removeDoor);
   const updateAnnotation = useDesignStore((s) => s.updateAnnotation);
   const removeAnnotation = useDesignStore((s) => s.removeAnnotation);
+  const updateCable = useDesignStore((s) => s.updateCable);
+  const removeCable = useDesignStore((s) => s.removeCable);
+  const selectCable = useDesignStore((s) => s.selectCable);
+  const selectedCable =
+    selectedCableId && floor
+      ? (floor.cables ?? []).find((c) => c.id === selectedCableId) ?? null
+      : null;
 
   const selected: Device | null =
     floor?.devices.find((d) => d.id === selectedId) ?? null;
@@ -75,9 +89,11 @@ export function PropertiesPanel() {
                     : selectedAnnotation.kind === "idea"
                       ? "Idea"
                       : "Note"
-                  : floor
-                    ? "Floor settings"
-                    : "Properties"}
+                  : selectedCable
+                    ? "Cable run"
+                    : floor
+                      ? "Floor settings"
+                      : "Properties"}
           </div>
           {(selected || selectedDoor) && (
             <div className="mt-0.5 text-[0.74rem] text-muted-foreground">
@@ -137,11 +153,24 @@ export function PropertiesPanel() {
               }
               onDelete={() => removeAnnotation(floor.id, selectedAnnotation.id)}
             />
+          ) : selectedCable && floor ? (
+            <CableForm
+              cable={selectedCable}
+              devices={floor.devices}
+              onChange={(partial) =>
+                updateCable(floor.id, selectedCable.id, partial)
+              }
+              onDelete={() => {
+                removeCable(floor.id, selectedCable.id);
+                selectCable(null);
+              }}
+            />
           ) : floor && design ? (
             <FloorForm
               name={floor.name}
               scale={floor.scale}
               ceilingHeight={floor.ceilingHeight}
+              wallStyle={floor.wallStyle ?? "plain"}
               onChange={(partial) => updateFloor(floor.id, partial)}
             />
           ) : (
@@ -159,12 +188,19 @@ function FloorForm({
   name,
   scale,
   ceilingHeight,
+  wallStyle,
   onChange,
 }: {
   name: string;
   scale: number;
   ceilingHeight: number;
-  onChange: (partial: { name?: string; scale?: number; ceilingHeight?: number }) => void;
+  wallStyle: import("@/types/design").WallStyle;
+  onChange: (partial: {
+    name?: string;
+    scale?: number;
+    ceilingHeight?: number;
+    wallStyle?: import("@/types/design").WallStyle;
+  }) => void;
 }) {
   return (
     <div className="space-y-5">
@@ -215,6 +251,29 @@ function FloorForm({
             {ceilingHeight.toFixed(1)}
           </div>
         </div>
+      </div>
+
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">
+          Wall style
+        </Label>
+        <select
+          value={wallStyle}
+          onChange={(e) =>
+            onChange({
+              wallStyle: e.target.value as import("@/types/design").WallStyle,
+            })
+          }
+          className="w-full rounded-md border border-border bg-background/40 px-2 py-1.5 text-[0.85rem] outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/15"
+        >
+          <option value="plain">Plain drywall (default)</option>
+          <option value="painted">Painted drywall (richer texture)</option>
+          <option value="concrete">Polished concrete</option>
+          <option value="brick">Exposed brick</option>
+        </select>
+        <p className="text-xs text-muted-foreground">
+          Applied to all walls in the 3D view.
+        </p>
       </div>
 
       <Separator />
@@ -295,14 +354,10 @@ function DeviceForm({
         />
       </div>
 
-      <Separator />
-
-      <InstallStatusPicker device={device} onChange={onChange} />
-
-      <CriticalDatesFields device={device} onChange={onChange} />
-
-      <DevicePhotosSection device={device} />
-
+      {/* Orientation block — pulled up to the top because rotation + tilt
+          are the controls users reach for most often when placing devices.
+          Anything below this (status, photos, dates) is reference info
+          that gets less per-session traffic. */}
       <Separator />
 
       <div className="space-y-2">
@@ -327,6 +382,54 @@ function DeviceForm({
           </div>
         </div>
       </div>
+
+      {/* Tilt — only meaningful for cameras, since they're the only devices
+          whose pitch changes what's actually visible to them. Slider is
+          centered at 0 so the user can grab the midpoint to "level" the
+          camera. Range −60° (looking up) to +60° (looking down). */}
+      {device.type === "camera" && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs text-muted-foreground">
+              Tilt (degrees)
+            </Label>
+            {(device.tilt ?? 0) !== 0 && (
+              <button
+                type="button"
+                onClick={() =>
+                  onChange({ tilt: 0 } as Partial<Device>)
+                }
+                className="text-[0.65rem] font-medium text-muted-foreground hover:text-foreground transition-colors"
+                title="Reset tilt to level"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <Slider
+              min={-60}
+              max={60}
+              step={1}
+              value={[Math.round(((device.tilt ?? 0) * 180) / Math.PI)]}
+              onValueChange={(v) =>
+                onChange({
+                  tilt: (pickValue(v) * Math.PI) / 180,
+                } as Partial<Device>)
+              }
+              className="flex-1"
+            />
+            <div className="font-mono text-sm w-12 text-right">
+              {Math.round(((device.tilt ?? 0) * 180) / Math.PI)}°
+            </div>
+          </div>
+          <p className="text-[0.66rem] text-muted-foreground/80 leading-relaxed">
+            Positive = aim down, negative = aim up. Matters for wall-mounted
+            cameras — a camera tilted up won&apos;t see people on the floor in
+            front of it.
+          </p>
+        </div>
+      )}
 
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">
@@ -384,6 +487,21 @@ function DeviceForm({
       {device.type === "network" && (
         <NetworkDeviceFields device={device} onChange={onChange} />
       )}
+
+      <Separator />
+
+      {/* Lifecycle metadata — moved BELOW the orientation + coverage
+          fields because they're reference info, not the controls users
+          reach for during placement. */}
+      <InstallStatusPicker device={device} onChange={onChange} />
+
+      <CriticalDatesFields device={device} onChange={onChange} />
+
+      <DevicePhotosSection device={device} />
+
+      <Separator />
+
+      <AppearanceFields device={device} onChange={onChange} />
 
       <Separator />
 
@@ -694,6 +812,131 @@ function DevicePhotosSection({ device }: { device: Device }) {
 
 const LENS_COLORS = ["#3b82f6", "#06b6d4", "#f97316", "#e879f9", "#facc15", "#10b981"];
 
+/* ── Appearance overrides (custom color + coverage opacity) ──────────────
+   Lets a user paint a single device a custom color (overrides the type
+   default in BOTH the 2D marker and the 3D mesh accent) and dial the
+   visibility of its coverage area. Mirrors System Surveyor's per-element
+   color + AOC opacity controls. */
+
+/** Defaults the color picker swatch falls back to when no override is set. */
+const TYPE_DEFAULT_COLOR: Record<Device["type"], string> = {
+  camera: "#3b82f6",
+  reader: "#0ea5e9",
+  sensor: "#f59e0b",
+  network: "#a78bfa",
+};
+
+function AppearanceFields({
+  device,
+  onChange,
+}: {
+  device: Device;
+  onChange: (partial: Partial<Device>) => void;
+}) {
+  const defaultColor = TYPE_DEFAULT_COLOR[device.type];
+  // Only show the opacity slider for devices whose coverage area is
+  // actually visible on the canvas. Readers have no coverage visualization.
+  const hasCoverage =
+    device.type === "camera" ||
+    device.type === "sensor" ||
+    (device.type === "network" && device.networkType === "access-point");
+  // Type-specific defaults so the slider isn't visually empty before the
+  // user touches it (cameras read at 9%, sensors at 25%).
+  const defaultOpacity = device.type === "camera" ? 0.09 : 0.25;
+  const currentOpacityPct = Math.round(
+    (device.customOpacity ?? defaultOpacity) * 100,
+  );
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <Label className="text-xs text-muted-foreground">Marker color</Label>
+          {device.customColor && (
+            <button
+              type="button"
+              onClick={() =>
+                onChange({ customColor: undefined } as Partial<Device>)
+              }
+              className="text-[0.7rem] text-muted-foreground hover:text-foreground"
+            >
+              Reset
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="color"
+            value={device.customColor ?? defaultColor}
+            onChange={(e) =>
+              onChange({ customColor: e.target.value } as Partial<Device>)
+            }
+            className="size-9 cursor-pointer rounded-md border border-border bg-transparent p-1"
+            aria-label="Pick marker color"
+          />
+          <input
+            type="text"
+            value={device.customColor ?? ""}
+            onChange={(e) => {
+              const v = e.target.value.trim();
+              onChange({
+                customColor: v ? v : undefined,
+              } as Partial<Device>);
+            }}
+            placeholder={defaultColor}
+            className="flex-1 rounded-md border border-border bg-background/40 px-2 py-1.5 font-mono text-[0.78rem] outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/15"
+          />
+        </div>
+        <p className="text-[0.7rem] text-muted-foreground/70">
+          Overrides the type-default color in both the 2D marker and the 3D
+          mesh accent.
+        </p>
+      </div>
+
+      {hasCoverage && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs text-muted-foreground">
+              Coverage opacity
+            </Label>
+            {device.customOpacity !== undefined && (
+              <button
+                type="button"
+                onClick={() =>
+                  onChange({ customOpacity: undefined } as Partial<Device>)
+                }
+                className="text-[0.7rem] text-muted-foreground hover:text-foreground"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <Slider
+              min={0}
+              max={100}
+              step={1}
+              value={[currentOpacityPct]}
+              onValueChange={(v) =>
+                onChange({
+                  customOpacity: pickValue(v) / 100,
+                } as Partial<Device>)
+              }
+              className="flex-1"
+            />
+            <div className="font-mono text-sm w-12 text-right">
+              {currentOpacityPct}%
+            </div>
+          </div>
+          <p className="text-[0.7rem] text-muted-foreground/70">
+            Visibility of the FOV / detection area. 0% hides it; the actual
+            detection logic is unaffected.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Door form ─────────────────────────────────────────────────────────
    Properties for a placed door: width, lock state, label, notes, and the
    reader it's controlled by. */
@@ -796,6 +1039,13 @@ function DoorForm({
 
       <Separator />
 
+      <DoorLockSection
+        lock={door.lock}
+        onChange={(lock) => onChange({ lock })}
+      />
+
+      <Separator />
+
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">
           Controlled by reader
@@ -840,6 +1090,188 @@ function DoorForm({
         <Trash2 className="size-4" />
         Remove door
       </Button>
+    </div>
+  );
+}
+
+/* ── Door lock spec ────────────────────────────────────────────────────
+   Hardware spec for the lock on a door: mechanism type, brand, model,
+   voltage, fail mode, etc. Optional — empty type means "no spec". When
+   the user picks a type, the relevant follow-up fields appear. */
+const LOCK_TYPE_OPTIONS: { value: LockType; label: string }[] = [
+  { value: "mag-lock", label: "Mag lock (electromagnetic)" },
+  { value: "electric-strike", label: "Electric strike" },
+  { value: "electric-bolt", label: "Electric drop-bolt" },
+  { value: "magnetic-shear", label: "Magnetic shear (recessed)" },
+  { value: "smart-deadbolt", label: "Smart deadbolt (Schlage, Yale…)" },
+  { value: "smart-mortise", label: "Smart mortise (Salto, dormakaba…)" },
+  { value: "exit-device", label: "Exit device (crash bar)" },
+];
+
+function DoorLockSection({
+  lock,
+  onChange,
+}: {
+  lock: DoorLock | undefined;
+  onChange: (lock: DoorLock | undefined) => void;
+}) {
+  function patch(partial: Partial<DoorLock>) {
+    // Don't overwrite required fields with empty strings when patching;
+    // brand and model can be empty while the user is filling them in.
+    const base: DoorLock = lock ?? { type: "mag-lock", brand: "", model: "" };
+    onChange({ ...base, ...partial });
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <Label className="text-xs text-muted-foreground">
+          Lock hardware
+        </Label>
+        {lock && (
+          <button
+            type="button"
+            onClick={() => onChange(undefined)}
+            className="text-[0.68rem] text-muted-foreground hover:text-destructive transition-colors"
+            title="Clear lock spec"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <select
+          value={lock?.type ?? ""}
+          onChange={(e) => {
+            const v = e.target.value as LockType | "";
+            if (!v) onChange(undefined);
+            else patch({ type: v });
+          }}
+          className="w-full rounded-md border border-border bg-background/40 px-2 py-1.5 text-[0.85rem] outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/15"
+        >
+          <option value="">— No lock hardware —</option>
+          {LOCK_TYPE_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {lock && (
+        <div className="space-y-3 rounded-md border border-border/60 bg-background/30 p-3">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1">
+              <Label className="text-[0.68rem] text-muted-foreground">
+                Brand
+              </Label>
+              <Input
+                value={lock.brand}
+                onChange={(e) => patch({ brand: e.target.value })}
+                placeholder="HID, Schlage, Salto…"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-[0.68rem] text-muted-foreground">
+                Model
+              </Label>
+              <Input
+                value={lock.model}
+                onChange={(e) => patch({ model: e.target.value })}
+                placeholder="HES 9600, Encode…"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1">
+              <Label className="text-[0.68rem] text-muted-foreground">
+                Voltage
+              </Label>
+              <select
+                value={lock.voltage ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  patch({ voltage: v === "12" ? 12 : v === "24" ? 24 : undefined });
+                }}
+                className="w-full rounded-md border border-border bg-background/40 px-2 py-1.5 text-[0.82rem] outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/15"
+              >
+                <option value="">—</option>
+                <option value="12">12 VDC</option>
+                <option value="24">24 VDC</option>
+              </select>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-[0.68rem] text-muted-foreground">
+                Current draw (A)
+              </Label>
+              <Input
+                type="number"
+                inputMode="decimal"
+                step="0.05"
+                min="0"
+                value={lock.currentDrawA ?? ""}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  patch({
+                    currentDrawA: Number.isFinite(n) && n > 0 ? n : undefined,
+                  });
+                }}
+                placeholder="0.50"
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <Label className="text-[0.68rem] text-muted-foreground">
+              Fail mode
+            </Label>
+            <div className="flex items-center gap-px rounded-md bg-foreground/[0.05] p-0.5">
+              {(["fail-safe", "fail-secure"] as LockFailMode[]).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => patch({ failMode: m })}
+                  className={cn(
+                    "flex-1 inline-flex items-center justify-center gap-1.5 rounded px-2 py-1 text-[0.72rem] font-medium transition-colors",
+                    lock.failMode === m
+                      ? "bg-card text-foreground shadow-[0_1px_2px_-1px_rgba(0,0,0,0.18)]"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {m === "fail-safe" ? "Fail-safe (unlock on power loss)" : "Fail-secure (stay locked)"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-[0.78rem] text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={lock.weatherRated === true}
+              onChange={(e) =>
+                patch({ weatherRated: e.target.checked ? true : undefined })
+              }
+              className="rounded border-border"
+            />
+            Weather-rated (exterior)
+          </label>
+
+          <div className="space-y-1">
+            <Label className="text-[0.68rem] text-muted-foreground">
+              Notes
+            </Label>
+            <Input
+              value={lock.notes ?? ""}
+              onChange={(e) =>
+                patch({ notes: e.target.value || undefined })
+              }
+              placeholder="Compatible with… / power-supply note"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1150,6 +1582,209 @@ function AnnotationForm({
       >
         <Trash2 className="size-3.5" />
         Delete annotation
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * Cable properties form. Lets a pro change the cable type (Cat6 ↔
+ * Cat6a ↔ 22/4 ↔ fiber etc.), override the auto-picked color for
+ * run-grouping in the permit drawings, add notes ("plenum-rated; via
+ * IDF-2 riser"), and delete the run.
+ */
+function CableForm({
+  cable,
+  devices,
+  onChange,
+  onDelete,
+}: {
+  cable: Cable;
+  devices: Device[];
+  onChange: (partial: Partial<Cable>) => void;
+  onDelete: () => void;
+}) {
+  const src = devices.find((d) => d.id === cable.sourceDeviceId);
+  const tgt = devices.find((d) => d.id === cable.targetDeviceId);
+  const color = cable.color ?? CABLE_COLORS[cable.type];
+
+  // Total length for display (source → waypoints → target in pixels,
+  // then we need a scale — we DON'T have it here, so just show segment
+  // count + waypoint count instead. Length appears in the cable label
+  // on the canvas already.)
+  const segCount = cable.waypoints.length + 1;
+
+  // Friendly cable-type options
+  const TYPE_OPTS: CableType[] = [
+    "cat6",
+    "cat6a",
+    "fiber",
+    "22-4",
+    "18-2",
+    "16-2",
+    "rg59",
+    "speaker-16-2",
+  ];
+
+  return (
+    <div className="space-y-4">
+      {/* Endpoints summary — read-only since drag-to-rewire would
+          duplicate the wire tool. */}
+      <div className="rounded-lg border border-border/60 bg-card/40 p-3">
+        <div className="text-[0.62rem] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+          Endpoints
+        </div>
+        <div className="mt-1.5 space-y-1 text-[0.78rem]">
+          <div className="flex items-center gap-2">
+            <span
+              className="size-2 shrink-0 rounded-full"
+              style={{ background: color }}
+            />
+            <span className="text-muted-foreground">From</span>
+            <span className="font-medium text-foreground/95 truncate">
+              {src?.label ?? "—"}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="ml-[7px] inline-block h-3 w-px bg-border/70" />
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className="size-2 shrink-0 rounded-full"
+              style={{ background: color }}
+            />
+            <span className="text-muted-foreground">To</span>
+            <span className="font-medium text-foreground/95 truncate">
+              {tgt?.label ?? "—"}
+            </span>
+          </div>
+        </div>
+        <div className="mt-2 text-[0.7rem] text-muted-foreground/75">
+          {segCount} segment{segCount === 1 ? "" : "s"}
+          {cable.waypoints.length > 0 &&
+            ` · ${cable.waypoints.length} bend${cable.waypoints.length === 1 ? "" : "s"}`}
+        </div>
+      </div>
+
+      {/* Cable type */}
+      <div>
+        <Label
+          htmlFor="cable-type"
+          className="text-[0.72rem] font-medium uppercase tracking-[0.06em] text-muted-foreground"
+        >
+          Cable type
+        </Label>
+        <select
+          id="cable-type"
+          value={cable.type}
+          onChange={(e) =>
+            onChange({
+              type: e.target.value as CableType,
+              // Reset any color override when changing type so the new
+              // type's default color takes effect — the user can pick a
+              // new override below if they still want one.
+              color: undefined,
+            })
+          }
+          className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-[0.82rem] focus:border-primary/40 focus:outline-none focus:ring-2 focus:ring-primary/15"
+        >
+          {TYPE_OPTS.map((t) => (
+            <option key={t} value={t}>
+              {CABLE_LABELS[t]}
+            </option>
+          ))}
+        </select>
+        <div className="mt-1 text-[0.66rem] text-muted-foreground/70">
+          Drives the cable schedule + bill of materials line.
+        </div>
+      </div>
+
+      {/* Color override */}
+      <div>
+        <Label className="text-[0.72rem] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+          Color
+        </Label>
+        <div className="mt-1.5 flex items-center gap-2">
+          <input
+            type="color"
+            value={color}
+            onChange={(e) => onChange({ color: e.target.value })}
+            className="h-9 w-12 cursor-pointer rounded-md border border-border bg-background"
+            aria-label="Cable display color"
+          />
+          <Input
+            value={color}
+            onChange={(e) => onChange({ color: e.target.value })}
+            placeholder="#2563eb"
+            className="h-9 flex-1 font-mono text-[0.78rem]"
+          />
+          {cable.color && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => onChange({ color: undefined })}
+              className="h-9 px-2 text-[0.72rem]"
+            >
+              Reset
+            </Button>
+          )}
+        </div>
+        <div className="mt-1 text-[0.66rem] text-muted-foreground/70">
+          Useful for grouping runs by zone (e.g. all 1st-floor cameras green).
+        </div>
+      </div>
+
+      {/* Label override */}
+      <div>
+        <Label
+          htmlFor="cable-label"
+          className="text-[0.72rem] font-medium uppercase tracking-[0.06em] text-muted-foreground"
+        >
+          Label
+        </Label>
+        <Input
+          id="cable-label"
+          value={cable.label ?? ""}
+          onChange={(e) =>
+            onChange({ label: e.target.value || undefined })
+          }
+          placeholder={CABLE_LABELS[cable.type]}
+          className="mt-1.5"
+        />
+      </div>
+
+      {/* Notes */}
+      <div>
+        <Label
+          htmlFor="cable-notes"
+          className="text-[0.72rem] font-medium uppercase tracking-[0.06em] text-muted-foreground"
+        >
+          Notes
+        </Label>
+        <textarea
+          id="cable-notes"
+          value={cable.notes ?? ""}
+          onChange={(e) =>
+            onChange({ notes: e.target.value || undefined })
+          }
+          placeholder="e.g. plenum-rated jacket; via IDF-2 riser; pull with #4 messenger"
+          rows={3}
+          className="mt-1.5 w-full rounded-md border border-border bg-background px-2.5 py-2 text-[0.78rem] outline-none transition-colors placeholder:text-muted-foreground/55 focus:border-primary/40 focus:ring-2 focus:ring-primary/15"
+        />
+      </div>
+
+      <Separator />
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        onClick={onDelete}
+        className="w-full justify-start gap-2 text-rose-600 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400"
+      >
+        <Trash2 className="size-3.5" />
+        Delete cable
       </Button>
     </div>
   );

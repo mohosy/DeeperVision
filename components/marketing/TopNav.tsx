@@ -12,7 +12,10 @@ export function TopNav() {
             <Eye className="size-3.5 text-primary" />
           </div>
           <span className="font-medium tracking-[-0.01em] text-[0.97rem]">
-            DeeperVision
+            DeeperVision{" "}
+            <span className="ml-0.5 inline-flex items-center rounded-md bg-gradient-to-br from-violet-500/15 to-fuchsia-500/15 px-1.5 py-0 text-[0.66rem] font-semibold uppercase tracking-[0.08em] text-violet-600 ring-1 ring-violet-500/30 dark:text-violet-300">
+              AI
+            </span>
           </span>
         </Link>
         <nav className="flex items-center gap-1 sm:gap-1.5 text-sm">

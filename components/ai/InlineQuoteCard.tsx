@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import {
   Banknote,
   ChevronDown,
@@ -58,7 +59,7 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
   const deviceCount = breakdown.rows.reduce((sum, r) => sum + r.quantity, 0);
 
   return (
-    <div className="mx-3 mt-3 rounded-xl border border-border/70 bg-gradient-to-br from-primary/[0.05] to-transparent">
+    <div className="mx-3 mt-3 rounded-xl bg-gradient-to-br from-primary/[0.08] via-primary/[0.03] to-transparent ring-1 ring-primary/15 shadow-[0_1px_3px_-1px_oklch(0_0_0/6%)]">
       {/* Compact header — always visible */}
       <button
         type="button"
@@ -74,7 +75,7 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
               Live quote
             </div>
             <div className="text-[1.05rem] font-semibold tracking-[-0.01em] tabular-nums">
-              {formatUSD(breakdown.grandTotal)}
+              <AnimatedTotal value={breakdown.grandTotal} />
               <span className="ml-1.5 text-[0.7rem] font-normal text-muted-foreground">
                 · {deviceCount} device{deviceCount === 1 ? "" : "s"}
               </span>
@@ -88,10 +89,12 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
         )}
       </button>
 
-      {/* Expanded body — hero stats + small BoM peek + actions */}
+      {/* Expanded body — hero stats + small BoM peek + actions.
+          No internal divider — whitespace + the tinted card edge already
+          read as "this is the same surface continuing below." */}
       {expanded && (
-        <div className="border-t border-border/50 px-3 pb-3">
-          <div className="mt-3 grid grid-cols-3 gap-2">
+        <div className="px-3 pb-3 pt-1">
+          <div className="grid grid-cols-3 gap-2">
             <Stat label="Hardware" value={formatUSD(breakdown.hardwareSubtotal)} />
             <Stat
               label="Labor"
@@ -105,13 +108,16 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
           </div>
 
           {breakdown.rows.length > 0 && (
-            <div className="mt-3 rounded-lg border border-border/50 bg-background/40 max-h-[180px] overflow-y-auto">
+            <div className="mt-3 overflow-hidden rounded-lg bg-background/50 max-h-[180px] overflow-y-auto">
               <table className="w-full text-[0.72rem]">
                 <tbody>
-                  {breakdown.rows.map((r) => (
+                  {breakdown.rows.map((r, i) => (
                     <tr
                       key={r.modelId}
-                      className="border-b border-border/30 last:border-b-0"
+                      className={cn(
+                        "transition-colors",
+                        i % 2 === 1 && "bg-foreground/[0.025]",
+                      )}
                     >
                       <td className="px-2 py-1.5">
                         <div className="font-medium truncate">{r.displayName}</div>
@@ -157,7 +163,7 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
             <button
               type="button"
               onClick={onOpenFullQuote}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-1 text-[0.7rem] font-medium hover:bg-foreground/[0.05] transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md bg-foreground/[0.04] px-2 py-1 text-[0.7rem] font-medium ring-1 ring-border/40 hover:bg-foreground/[0.08] hover:ring-border/60 transition-all"
             >
               <Printer className="size-3" strokeWidth={2.2} />
               Print quote
@@ -184,7 +190,7 @@ export function InlineQuoteCard({ onOpenFullQuote }: { onOpenFullQuote: () => vo
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-border/50 bg-background/40 px-2 py-1.5">
+    <div className="rounded-lg bg-foreground/[0.04] px-2 py-1.5">
       <div className="text-[0.56rem] font-medium uppercase tracking-[0.1em] text-muted-foreground">
         {label}
       </div>
@@ -192,5 +198,52 @@ function Stat({ label, value }: { label: string; value: string }) {
         {value}
       </div>
     </div>
+  );
+}
+
+/**
+ * Animated currency total. When the value changes:
+ *  • The text color flashes emerald (up) or rose (down) for ~900 ms
+ *    and fades back to neutral.
+ *  • A short scale "pop" (1.0 → 1.06 → 1.0) draws the eye to the change
+ *    without distorting the layout around it.
+ *
+ * Earlier iterations animated per-digit with absolute positioning and
+ * AnimatePresence; that was visually nice but kept clipping the number
+ * on small containers and glitching on rapid successive changes. The
+ * simpler color-flash + scale pulse is bulletproof and still feels
+ * "alive" when the AI is editing the quote.
+ */
+function AnimatedTotal({ value }: { value: number }) {
+  const prevRef = useRef(value);
+  const [direction, setDirection] = useState<"up" | "down" | null>(null);
+  const [pulseKey, setPulseKey] = useState(0);
+
+  useEffect(() => {
+    if (value === prevRef.current) return;
+    const dir = value > prevRef.current ? "up" : "down";
+    prevRef.current = value;
+    setDirection(dir);
+    // Bump a re-mount key so the scale animation re-fires even if the
+    // direction is unchanged between two rapid increases.
+    setPulseKey((k) => k + 1);
+    const t = window.setTimeout(() => setDirection(null), 900);
+    return () => window.clearTimeout(t);
+  }, [value]);
+
+  return (
+    <motion.span
+      key={pulseKey}
+      initial={{ scale: 1 }}
+      animate={{ scale: [1, 1.06, 1] }}
+      transition={{ duration: 0.45, ease: [0.2, 0.7, 0.3, 1] }}
+      className={cn(
+        "inline-block origin-left tabular-nums transition-colors duration-300",
+        direction === "up" && "text-emerald-500",
+        direction === "down" && "text-rose-500",
+      )}
+    >
+      {formatUSD(value)}
+    </motion.span>
   );
 }

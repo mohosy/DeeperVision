@@ -4,8 +4,10 @@ import {
   DoorOpen,
   Eye,
   EyeOff,
+  Cable as CableIcon,
   Maximize,
   MousePointer2,
+  Move,
   Ruler,
   Square,
   Undo2,
@@ -65,6 +67,20 @@ export function Canvas2DToolbar({ onFit, onUpload }: ToolbarProps) {
         shortcut="C"
         active={tool === "calibrate"}
         onClick={() => setTool("calibrate")}
+      />
+      <ToolButton
+        icon={Move}
+        label="Adjust walls (drag endpoints to match the floor plan)"
+        shortcut="E"
+        active={tool === "correct-walls"}
+        onClick={() => setTool("correct-walls")}
+      />
+      <ToolButton
+        icon={CableIcon}
+        label="Wire (click source device, click target — Shift-click to bend)"
+        shortcut="X"
+        active={tool === "wire"}
+        onClick={() => setTool("wire")}
       />
 
       <Spacer />

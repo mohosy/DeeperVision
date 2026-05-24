@@ -131,6 +131,115 @@ export function pointToSegment(
 }
 
 /**
+ * Intersect a ray (origin + t·dir, t ≥ 0) with a single line segment (a, b).
+ * Returns the distance `t` along the ray to the hit, or `null` if the ray
+ * misses the segment. `dir` should be a unit vector — the returned `t` is
+ * a distance in the same units as `origin`.
+ *
+ * Standard 2D parametric solve of   P + t·D = A + s·(B − A)   for t ≥ 0
+ * and s ∈ [0, 1].
+ */
+export function rayHitSegment(
+  origin: Vec2,
+  dir: Vec2,
+  a: Vec2,
+  b: Vec2,
+): number | null {
+  const sx = b.x - a.x;
+  const sy = b.y - a.y;
+  const denom = dir.x * sy - dir.y * sx;
+  if (Math.abs(denom) < 1e-9) return null; // parallel / coincident
+  const qx = a.x - origin.x;
+  const qy = a.y - origin.y;
+  const t = (qx * sy - qy * sx) / denom;
+  const s = (qx * dir.y - qy * dir.x) / denom;
+  if (t < 0 || s < 0 || s > 1) return null;
+  return t;
+}
+
+/**
+ * Build a closed-polygon FOV wedge for a camera that is clipped against a
+ * set of walls. The polygon's apex is the camera position, and each arc
+ * vertex is at the lesser of (range, distance to first wall hit) along
+ * its angular direction.
+ *
+ * Returned points are RELATIVE to the camera origin, so they can be fed
+ * straight into a Konva `<Line points={...} closed />` placed inside a
+ * Group positioned at the device's coords.
+ *
+ * The result is a "shadow-cast" cone — exactly what you'd see if you
+ * shone a flashlight from the camera, with the cone stopping at the
+ * first wall it hits.
+ */
+export function clippedFovPolygon(opts: {
+  /** Camera position in floor-plan pixel space. */
+  origin: Vec2;
+  /** Facing direction in radians (0 = +X, π/2 = +Y screen-south). */
+  rotation: number;
+  /** Horizontal FOV in degrees. */
+  fovDegrees: number;
+  /** Camera range in meters. */
+  rangeMeters: number;
+  /** Pixels-per-meter. */
+  scalePxPerMeter: number;
+  /** Walls in floor-plan pixel space. Anything ray-castable goes here. */
+  walls: { start: Vec2; end: Vec2 }[];
+  /** Angular resolution. 32 reads as a smooth cone at any sensible FOV. */
+  segments?: number;
+}): number[] {
+  const {
+    origin,
+    rotation,
+    fovDegrees,
+    rangeMeters,
+    scalePxPerMeter,
+    walls,
+    segments = 32,
+  } = opts;
+  const rangePx = rangeMeters * scalePxPerMeter;
+  const halfFov = (fovDegrees / 2) * (Math.PI / 180);
+  // Apex first, then segments+1 arc vertices.
+  const pts: number[] = [0, 0];
+  for (let i = 0; i <= segments; i++) {
+    const a = rotation - halfFov + (2 * halfFov * i) / segments;
+    const dir = { x: Math.cos(a), y: Math.sin(a) };
+    let hit = rangePx;
+    for (const wall of walls) {
+      const t = rayHitSegment(origin, dir, wall.start, wall.end);
+      if (t !== null && t < hit) hit = t;
+    }
+    pts.push(dir.x * hit, dir.y * hit);
+  }
+  return pts;
+}
+
+/**
+ * Signed-area of a polygon expressed as a flat point list
+ * `[x0, y0, x1, y1, …]`, computed via the shoelace formula. Returns the
+ * absolute area in the same squared units as the input coords (so
+ * floor-plan pixels² unless you've scaled first). Returns 0 if fewer
+ * than 3 vertices.
+ *
+ * Used by the AI route to compare a camera's *actual* wall-clipped
+ * coverage against its nominal FOV cone area, so the agent can spot
+ * cameras that are wasting most of their FOV behind a wall.
+ */
+export function polygonArea(points: number[]): number {
+  const n = Math.floor(points.length / 2);
+  if (n < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const x1 = points[i * 2];
+    const y1 = points[i * 2 + 1];
+    const j = (i + 1) % n;
+    const x2 = points[j * 2];
+    const y2 = points[j * 2 + 1];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) / 2;
+}
+
+/**
  * Snap a candidate point to the nearest wall if it's within `snapThresholdPx`.
  * Returns the snapped position (sitting on the wall, slightly offset along the
  * outward normal so the device renders next to — not on top of — the wall)

@@ -28,6 +28,10 @@ interface SimState {
   blindIntervalStart: number | null;
   /** True once the sim has finished playing this run */
   finished: boolean;
+  /** When true, the camera is locked to the actor's first-person view
+   *  ("follow mode"). Orbit controls are suppressed and the FollowCamera
+   *  controller updates the camera every frame. */
+  following: boolean;
 
   play(): void;
   pause(): void;
@@ -41,6 +45,8 @@ interface SimState {
   pushEvent(event: SimEvent): void;
   recordFrameCoverage(dt: number): void;
   markFinished(): void;
+  startFollow(): void;
+  stopFollow(): void;
 }
 
 export const useSimStore = create<SimState>((set, get) => ({
@@ -57,6 +63,7 @@ export const useSimStore = create<SimState>((set, get) => ({
   longestBlindInterval: 0,
   blindIntervalStart: null,
   finished: false,
+  following: false,
 
   play() {
     set({ running: true, finished: false });
@@ -146,5 +153,11 @@ export const useSimStore = create<SimState>((set, get) => ({
       }
       return next;
     });
+  },
+  startFollow() {
+    set({ following: true });
+  },
+  stopFollow() {
+    set({ following: false });
   },
 }));

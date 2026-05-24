@@ -2,6 +2,11 @@ import type { Device, Floor } from "@/types/design";
 import { useDesignStore } from "@/lib/store";
 import { computeQuote, type ExtraLineItem } from "@/lib/pricing";
 import { planCabling } from "@/lib/cabling";
+import {
+  getProduct,
+  productCompatibility,
+  productEcosystem,
+} from "@/lib/catalog";
 
 /** One message in the chat panel. */
 export interface ChatMessage {
@@ -13,6 +18,15 @@ export interface ChatMessage {
   citations?: Citation[];
   /** Number of distinct web searches Claude ran during this turn. */
   webSearches?: number;
+  /** Image the user attached to this message (user messages only). The
+   *  thumbnail is rendered inline in the bubble, and the bytes are forwarded
+   *  to Claude as a vision content block on the request. */
+  attachedImage?: {
+    /** `data:<mime>;base64,<data>` — full data URL so it can also be rendered
+     *  in an <img>. */
+    dataUrl: string;
+    mediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  };
 }
 
 export interface Citation {
@@ -24,6 +38,10 @@ export interface Citation {
 export type ChatOperation =
   | {
       kind: "add-device";
+      /** Server-generated id. When set, the client passes it to
+          store.addDevice as the externalId so client + server agree on
+          which device subsequent ops in this turn reference. */
+      id?: string;
       deviceType: "camera" | "reader" | "sensor" | "network";
       subtype?: string;
       x: number;
@@ -49,10 +67,18 @@ export type ChatOperation =
       notes?: string;
       installStatus?: "proposed" | "installed" | "decommissioned";
     }
-  | { kind: "add-wall"; startX: number; startY: number; endX: number; endY: number }
+  | {
+      kind: "add-wall";
+      id?: string;
+      startX: number;
+      startY: number;
+      endX: number;
+      endY: number;
+    }
   | { kind: "remove-wall"; wallId: string }
   | {
       kind: "add-door";
+      id?: string;
       wallId: string;
       x: number;
       y: number;
@@ -62,6 +88,24 @@ export type ChatOperation =
       label: string;
     }
   | { kind: "set-floor-scale"; scalePxPerMeter: number }
+  | {
+      kind: "add-cable";
+      sourceDeviceId: string;
+      targetDeviceId: string;
+      cableType:
+        | "cat6"
+        | "cat6a"
+        | "fiber"
+        | "22-4"
+        | "18-2"
+        | "16-2"
+        | "rg59"
+        | "speaker-16-2";
+      waypoints?: { x: number; y: number }[];
+      label?: string;
+      notes?: string;
+    }
+  | { kind: "remove-cable"; cableId: string }
   | {
       kind: "add-annotation";
       x: number;
@@ -100,6 +144,27 @@ export type ChatOperation =
       kind: "set-view-mode";
       viewMode: "2d" | "3d" | "sim";
       threeDMode?: "orbit" | "walk";
+    }
+  | {
+      kind: "set-door-lock";
+      doorId: string;
+      clear?: boolean;
+      lockType?:
+        | "mag-lock"
+        | "electric-strike"
+        | "electric-bolt"
+        | "magnetic-shear"
+        | "smart-deadbolt"
+        | "smart-mortise"
+        | "exit-device";
+      brand?: string;
+      model?: string;
+      voltage?: 12 | 24;
+      currentDrawA?: number;
+      failMode?: "fail-safe" | "fail-secure";
+      weatherRated?: boolean;
+      compatibleWith?: string[];
+      notes?: string;
     };
 
 /** Streaming callbacks the UI subscribes to. */
@@ -108,9 +173,23 @@ export interface ChatStreamHandlers {
   onOperation?: (op: ChatOperation) => void;
   onWebSearch?: (query: string) => void;
   onWebSearchDone?: (count: number) => void;
+  /** A server-executed tool (analyze_coverage / run_advisor / fetch_url)
+   *  has started running. Fired with a friendly label the UI can show. */
+  onToolStart?: (info: { name: string; label: string }) => void;
+  /** A server-executed tool finished. The result was passed back to
+   *  Claude — the UI just hides the progress pill. */
+  onToolEnd?: (info: { name: string }) => void;
   onCitation?: (citation: Citation) => void;
   onTurn?: (index: number) => void;
-  onDone?: (summary: { usage: { inputTokens: number; outputTokens: number }; webSearches: number }) => void;
+  onDone?: (summary: {
+    usage: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheCreationTokens?: number;
+      cacheReadTokens?: number;
+    };
+    webSearches: number;
+  }) => void;
   onError?: (message: string) => void;
 }
 
@@ -168,6 +247,19 @@ function summarizeFloorForChat(floor: Floor) {
       widthMeters: d.widthMeters,
       locked: d.locked,
       label: d.label,
+      lock: d.lock
+        ? {
+            type: d.lock.type,
+            brand: d.lock.brand,
+            model: d.lock.model,
+            voltage: d.lock.voltage,
+            currentDrawA: d.lock.currentDrawA,
+            failMode: d.lock.failMode,
+            weatherRated: d.lock.weatherRated,
+            compatibleWith: d.lock.compatibleWith,
+            notes: d.lock.notes,
+          }
+        : undefined,
     })),
     annotations: (floor.annotations ?? []).map((a) => ({
       id: a.id,
@@ -188,11 +280,31 @@ function summarizeFloorForChat(floor: Floor) {
  * Supports cancellation via AbortSignal — the panel uses this for the
  * Stop button.
  */
+/** Wire shape for a single user/assistant message sent to the API. Either a
+ *  plain text string or — for multimodal user turns with an attached image —
+ *  an array of content blocks compatible with Anthropic's vision input. */
+export type WireMessage = {
+  role: "user" | "assistant";
+  content:
+    | string
+    | Array<
+        | { type: "text"; text: string }
+        | {
+            type: "image";
+            source: {
+              type: "base64";
+              media_type: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+              data: string;
+            };
+          }
+      >;
+};
+
 export async function streamAIChat(args: {
   designName: string;
   buildingType?: string;
   floor: Floor;
-  messages: { role: "user" | "assistant"; content: string }[];
+  messages: WireMessage[];
   handlers: ChatStreamHandlers;
   signal?: AbortSignal;
 }): Promise<void> {
@@ -231,14 +343,22 @@ export async function streamAIChat(args: {
         unitCost: li.unitCost,
         category: li.category,
       })),
-      bom: breakdown.rows.map((r) => ({
-        modelId: r.modelId,
-        displayName: r.displayName,
-        vendor: r.vendor,
-        quantity: r.quantity,
-        unitPrice: r.unitPrice,
-        subtotal: r.subtotal,
-      })),
+      bom: breakdown.rows.map((r) => {
+        // Look up ecosystem/compatibility from the catalog when this BoM
+        // row corresponds to a real product — lets the agent flag
+        // mixed-vendor combos against real data, not its guesswork.
+        const product = getProduct(r.modelId);
+        return {
+          modelId: r.modelId,
+          displayName: r.displayName,
+          vendor: r.vendor,
+          quantity: r.quantity,
+          unitPrice: r.unitPrice,
+          subtotal: r.subtotal,
+          ecosystem: product ? productEcosystem(product) : undefined,
+          compatibility: product ? productCompatibility(product) : undefined,
+        };
+      }),
       hardwareSubtotal: breakdown.hardwareSubtotal,
       laborSubtotal: breakdown.laborSubtotal,
       grandTotal: breakdown.grandTotal,
@@ -302,6 +422,12 @@ export async function streamAIChat(args: {
       case "web_search_done":
         h.onWebSearchDone?.((parsed as { count: number }).count);
         break;
+      case "tool_start":
+        h.onToolStart?.(parsed as { name: string; label: string });
+        break;
+      case "tool_end":
+        h.onToolEnd?.(parsed as { name: string });
+        break;
       case "citation":
         h.onCitation?.(parsed as Citation);
         break;
@@ -311,7 +437,12 @@ export async function streamAIChat(args: {
       case "done":
         h.onDone?.(
           parsed as {
-            usage: { inputTokens: number; outputTokens: number };
+            usage: {
+              inputTokens: number;
+              outputTokens: number;
+              cacheCreationTokens?: number;
+              cacheReadTokens?: number;
+            };
             webSearches: number;
           },
         );
@@ -365,10 +496,16 @@ export function applyChatOperation(floorId: string, op: ChatOperation): boolean 
 
   try {
     if (op.kind === "add-device") {
-      const created = store.addDevice(floorId, op.deviceType, {
-        x: op.x,
-        y: op.y,
-      });
+      // op.id is the server-generated id from the chat agent's floor
+      // mirror. Passing it through means the agent's NEXT op in the
+      // same turn (move/rotate/validate) can reference this device by id.
+      const created = store.addDevice(
+        floorId,
+        op.deviceType,
+        { x: op.x, y: op.y },
+        undefined,
+        op.id,
+      );
       if (!created) return false;
       const partial: Partial<Device> = {
         label: op.label,
@@ -454,11 +591,15 @@ export function applyChatOperation(floorId: string, op: ChatOperation): boolean 
       return true;
     }
     if (op.kind === "add-wall") {
-      store.addWall(floorId, {
-        start: { x: op.startX, y: op.startY },
-        end: { x: op.endX, y: op.endY },
-        height: floor.ceilingHeight,
-      });
+      store.addWall(
+        floorId,
+        {
+          start: { x: op.startX, y: op.startY },
+          end: { x: op.endX, y: op.endY },
+          height: floor.ceilingHeight,
+        },
+        op.id,
+      );
       return true;
     }
     if (op.kind === "remove-wall") {
@@ -504,19 +645,44 @@ export function applyChatOperation(floorId: string, op: ChatOperation): boolean 
           snappedRot = Math.atan2(dy, dx);
         }
       }
-      store.addDoor(floorId, {
-        position: { x: snappedX, y: snappedY },
-        rotation: snappedRot,
-        widthMeters: op.widthMeters,
-        wallId: op.wallId,
-        locked: op.locked,
-        label: op.label,
-        notes: "",
-      });
+      store.addDoor(
+        floorId,
+        {
+          position: { x: snappedX, y: snappedY },
+          rotation: snappedRot,
+          widthMeters: op.widthMeters,
+          wallId: op.wallId,
+          locked: op.locked,
+          label: op.label,
+          notes: "",
+        },
+        op.id,
+      );
       return true;
     }
     if (op.kind === "set-floor-scale") {
       store.updateFloor(floorId, { scale: op.scalePxPerMeter });
+      return true;
+    }
+    if (op.kind === "add-cable") {
+      // Validate that the source / target devices actually exist on the
+      // floor — Claude occasionally references a stale id from a prior
+      // turn or a freshly-removed device.
+      const src = floor.devices.find((d) => d.id === op.sourceDeviceId);
+      const tgt = floor.devices.find((d) => d.id === op.targetDeviceId);
+      if (!src || !tgt) return false;
+      store.addCable(floorId, {
+        sourceDeviceId: op.sourceDeviceId,
+        targetDeviceId: op.targetDeviceId,
+        type: op.cableType,
+        waypoints: op.waypoints ?? [],
+        label: op.label,
+        notes: op.notes,
+      });
+      return true;
+    }
+    if (op.kind === "remove-cable") {
+      store.removeCable(floorId, op.cableId);
       return true;
     }
     if (op.kind === "add-annotation") {
@@ -572,6 +738,33 @@ export function applyChatOperation(floorId: string, op: ChatOperation): boolean 
       }
       return true;
     }
+    if (op.kind === "set-door-lock") {
+      const door = floor.doors.find((d) => d.id === op.doorId);
+      if (!door) return false;
+      if (op.clear) {
+        store.updateDoor(floor.id, op.doorId, { lock: undefined });
+        return true;
+      }
+      const base: import("@/types/design").DoorLock = door.lock ?? {
+        type: op.lockType ?? "mag-lock",
+        brand: "",
+        model: "",
+      };
+      const merged: import("@/types/design").DoorLock = {
+        ...base,
+        ...(op.lockType !== undefined && { type: op.lockType }),
+        ...(op.brand !== undefined && { brand: op.brand }),
+        ...(op.model !== undefined && { model: op.model }),
+        ...(op.voltage !== undefined && { voltage: op.voltage }),
+        ...(op.currentDrawA !== undefined && { currentDrawA: op.currentDrawA }),
+        ...(op.failMode !== undefined && { failMode: op.failMode }),
+        ...(op.weatherRated !== undefined && { weatherRated: op.weatherRated }),
+        ...(op.compatibleWith !== undefined && { compatibleWith: op.compatibleWith }),
+        ...(op.notes !== undefined && { notes: op.notes }),
+      };
+      store.updateDoor(floor.id, op.doorId, { lock: merged });
+      return true;
+    }
     if (op.kind === "update-quote-settings") {
       const partial: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(op)) {
@@ -620,6 +813,10 @@ export function describeOperation(op: ChatOperation): string {
       return `+ door "${op.label}"`;
     case "set-floor-scale":
       return `↻ scale → ${op.scalePxPerMeter.toFixed(0)} px/m`;
+    case "add-cable":
+      return `⚡ ${op.cableType} cable`;
+    case "remove-cable":
+      return `× cable ${op.cableId}`;
     case "add-annotation":
       // Slightly longer truncation than before so most chip text reads
       // intelligibly in the chip itself. Full text is available via the
@@ -635,6 +832,14 @@ export function describeOperation(op: ChatOperation): string {
       return `👁 POV ${op.deviceId}`;
     case "set-view-mode":
       return `→ ${op.viewMode.toUpperCase()}${op.threeDMode ? ` (${op.threeDMode})` : ""}`;
+    case "set-door-lock": {
+      if (op.clear) return `× lock on ${op.doorId}`;
+      const bits: string[] = [];
+      if (op.lockType) bits.push(op.lockType);
+      if (op.brand || op.model) bits.push(`${op.brand ?? ""} ${op.model ?? ""}`.trim());
+      if (op.failMode) bits.push(op.failMode);
+      return `🔒 ${bits.length ? bits.join(" · ") : "lock updated"}`;
+    }
     case "update-quote-settings": {
       const bits: string[] = [];
       if (op.clientName) bits.push(`client "${op.clientName}"`);
@@ -677,9 +882,9 @@ export function citationHost(url: string): string {
 export function trimHistoryForServer(
   messages: ChatMessage[],
   keepRecent = 14,
-): { role: "user" | "assistant"; content: string }[] {
+): WireMessage[] {
   if (messages.length <= keepRecent + 2) {
-    return messages.map((m) => ({ role: m.role, content: m.content }));
+    return messages.map(toWireMessage);
   }
   const older = messages.slice(0, messages.length - keepRecent);
   const recent = messages.slice(messages.length - keepRecent);
@@ -726,7 +931,33 @@ export function trimHistoryForServer(
     role: "user",
     content: lines.join("\n"),
   };
-  return [recap, ...recent].map((m) => ({ role: m.role, content: m.content }));
+  return [recap, ...recent].map(toWireMessage);
+}
+
+/**
+ * Convert a ChatMessage to the wire shape sent to /api/ai/chat. User messages
+ * with an attached image become multimodal `content` arrays; everything else
+ * stays a plain string so existing callers and the server's text path keep
+ * working unchanged.
+ */
+function toWireMessage(m: ChatMessage): WireMessage {
+  if (m.role === "user" && m.attachedImage) {
+    const { dataUrl, mediaType } = m.attachedImage;
+    // `data:image/png;base64,XXXX` → strip the prefix for Anthropic's
+    // base64 source block.
+    const base64 = dataUrl.includes(",") ? dataUrl.split(",", 2)[1] : dataUrl;
+    return {
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: { type: "base64", media_type: mediaType, data: base64 },
+        },
+        { type: "text", text: m.content || "(image attached)" },
+      ],
+    };
+  }
+  return { role: m.role, content: m.content };
 }
 
 /**

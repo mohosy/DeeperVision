@@ -50,11 +50,35 @@ interface ProposedDevice {
   rationale: string;
 }
 
+interface ProposedFurniture {
+  type:
+    | "desk"
+    | "chair"
+    | "conference-table"
+    | "kitchen-island"
+    | "sofa"
+    | "toilet"
+    | "sink"
+    | "refrigerator"
+    | "bed"
+    | "bookshelf"
+    | "tv-display";
+  /** Center point in image-pixel coords */
+  x: number;
+  y: number;
+  rotationDegrees: number;
+  lengthM: number;
+  widthM: number;
+  label?: string;
+  rationale?: string;
+}
+
 interface SurveyResponse {
   /** Estimated pixels-per-meter for the uploaded image */
   scalePxPerMeter: number;
   walls: ProposedWall[];
   devices: ProposedDevice[];
+  furniture: ProposedFurniture[];
   /** Claude's overall summary of the design */
   summary: string;
   /** Total tokens used (for cost monitoring) */
@@ -102,6 +126,48 @@ const TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
+    name: "propose_furniture",
+    description:
+      "Add one piece of furniture if it is CLEARLY visible in the floor plan. Supported types: desk, chair, conference-table, kitchen-island, sofa, toilet, sink, refrigerator, bed, bookshelf, tv-display. Position (x, y) is the CENTER of the piece, in image-pixel coords. Rotation is in degrees: 0 = piece's long axis along +X (right); 90 = long axis along +Y (down). Length/width are real-world meters — use the scale you set to derive them from the visible footprint. ONLY propose furniture you can clearly see in the floor plan; do NOT invent or guess furniture for empty rooms.",
+    input_schema: {
+      type: "object",
+      properties: {
+        type: {
+          type: "string",
+          enum: [
+            "desk",
+            "chair",
+            "conference-table",
+            "kitchen-island",
+            "sofa",
+            "toilet",
+            "sink",
+            "refrigerator",
+            "bed",
+            "bookshelf",
+            "tv-display",
+          ],
+        },
+        x: { type: "number" },
+        y: { type: "number" },
+        rotationDegrees: { type: "number" },
+        lengthM: {
+          type: "number",
+          description:
+            "Real-world length in meters (the long axis). Typical defaults: desk 1.5, chair 0.6, conference-table 3.0, kitchen-island 2.4, sofa 2.2.",
+        },
+        widthM: {
+          type: "number",
+          description:
+            "Real-world width in meters (perpendicular to length). Typical defaults: desk 0.75, chair 0.6, conference-table 1.2, kitchen-island 1.0, sofa 0.95.",
+        },
+        label: { type: "string" },
+        rationale: { type: "string" },
+      },
+      required: ["type", "x", "y", "rotationDegrees", "lengthM", "widthM"],
+    },
+  },
+  {
     name: "finalize",
     description:
       "Call this last to provide a brief summary paragraph (2-3 sentences) describing the overall design and its coverage strategy.",
@@ -117,13 +183,28 @@ const TOOLS: Anthropic.Messages.Tool[] = [
 
 const SYSTEM_PROMPT = `You are a senior security-systems designer turning a floor plan image into a clean WALL TRACE for DeeperVision, a CAD tool for commercial security installs.
 
-You are given a floor plan image. Your ONLY job for this survey is:
+You are given a floor plan image. Your job for this survey is:
 
 1. Call set_scale FIRST to estimate pixels-per-meter from visible clues.
 2. Call propose_wall for every wall segment you see (exterior + interior). Be thorough — the user will use this trace to design their security system.
-3. Call finalize with a brief one-sentence summary of the layout.
+3. Call propose_furniture for each piece of furniture CLEARLY VISIBLE in the floor plan (desks, chairs, conference tables, kitchen islands, sofas). Use the SET SCALE to derive each piece's real-world length/width in meters from its visible footprint. Place the center coordinate at the geometric centroid of the piece's symbol; pick a rotation that aligns the piece's long axis with how it appears in the image. If a room is empty (no furniture drawn in the floor plan), DO NOT propose any — leave it empty.
+4. Call finalize with a brief one-sentence summary of the layout.
 
-DO NOT call propose_device. The user adds cameras, readers, sensors, and network gear themselves — either by dragging from the library or by asking the AI editor in the chat panel. Your job here is ONLY the walls + scale.
+DO NOT call propose_device. The user adds cameras, readers, sensors, and network gear themselves — either by dragging from the library or by asking the AI editor in the chat panel. Your job here is walls + furniture + scale.
+
+═══════════════════════════════════════════════════════════════════════
+FURNITURE PLACEMENT RULES — be conservative and accurate
+═══════════════════════════════════════════════════════════════════════
+
+For every furniture piece you propose:
+  • Position MUST be the visible centroid in image pixels.
+  • Rotation: 0° = piece's long axis horizontal (along +X). 90° = vertical (along +Y, downward).
+  • Length/width are real-world METERS, derived from the visible pixel footprint divided by your set scalePxPerMeter. Typical defaults if the piece appears at standard size:
+      desk 1.5×0.75, chair 0.6×0.6, conference-table 3.0×1.2, kitchen-island 2.4×1.0, sofa 2.2×0.95,
+      toilet 0.7×0.42, sink 0.6×0.5, refrigerator 0.85×0.72, bed 2.0×1.5, bookshelf 1.0×0.35, tv-display 1.4×0.1.
+  • Only flag a piece you can VISUALLY identify. Don't guess that a conference room "probably has" a table — only propose one if you can see it drawn.
+  • For bathrooms, expect to see at least one toilet + one sink. For kitchens, expect a refrigerator + stove area (use kitchen-island for counters). For bedrooms, expect a bed + maybe a wardrobe (use bookshelf as the closest match). For lounges, expect sofas + a TV.
+  • A typical commercial floor plan has 5–20 furniture items at most. Never propose more than 30.
 
 ═══════════════════════════════════════════════════════════════════════
 COORDINATE RULES — CRITICAL, READ CAREFULLY
@@ -192,6 +273,7 @@ Analyze it and propose a complete first-pass security design by calling the tool
 
   const walls: ProposedWall[] = [];
   const devices: ProposedDevice[] = [];
+  const furniture: ProposedFurniture[] = [];
   let scalePxPerMeter = 50;
   let summary = "";
 
@@ -263,6 +345,22 @@ Analyze it and propose a complete first-pass security design by calling the tool
           rationale:
             typeof input.rationale === "string" ? input.rationale : "",
         });
+      } else if (tool.name === "propose_furniture") {
+        const ftype = input.type as ProposedFurniture["type"];
+        const allowed = ["desk", "chair", "conference-table", "kitchen-island", "sofa"] as const;
+        if (allowed.includes(ftype as (typeof allowed)[number])) {
+          furniture.push({
+            type: ftype,
+            x: Number(input.x) || 0,
+            y: Number(input.y) || 0,
+            rotationDegrees: Number(input.rotationDegrees) || 0,
+            lengthM: clamp(Number(input.lengthM) || 1, 0.3, 12),
+            widthM: clamp(Number(input.widthM) || 0.7, 0.3, 8),
+            label: typeof input.label === "string" ? input.label : undefined,
+            rationale:
+              typeof input.rationale === "string" ? input.rationale : undefined,
+          });
+        }
       } else if (tool.name === "finalize") {
         if (typeof input.summary === "string") summary = input.summary;
       }
@@ -296,6 +394,7 @@ Analyze it and propose a complete first-pass security design by calling the tool
     scalePxPerMeter,
     walls,
     devices,
+    furniture: furniture.slice(0, 30),
     summary,
     usage: { inputTokens: totalInput, outputTokens: totalOutput },
   };

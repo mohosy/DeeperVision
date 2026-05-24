@@ -15,22 +15,25 @@ import type { Device, DeviceType } from "@/types/design";
 export function applySurveyToActiveFloor(
   survey: SurveyResponse,
   planImageDataUrl: string,
-): { wallsAdded: number; devicesAdded: number } {
+): { wallsAdded: number; devicesAdded: number; furnitureAdded: number } {
   const store = useDesignStore.getState();
   const designId = store.currentDesignId;
-  if (!designId) return { wallsAdded: 0, devicesAdded: 0 };
+  const empty = { wallsAdded: 0, devicesAdded: 0, furnitureAdded: 0 };
+  if (!designId) return empty;
   const design = store.designs[designId];
-  if (!design) return { wallsAdded: 0, devicesAdded: 0 };
+  if (!design) return empty;
   const floor = design.floors.find((f) => f.id === design.activeFloorId);
-  if (!floor) return { wallsAdded: 0, devicesAdded: 0 };
+  if (!floor) return empty;
 
-  // 1. Update the floor with the plan image + scale. Walls are replaced by
-  //    the new trace; devices are PRESERVED so the user doesn't lose work
-  //    if they re-run the survey after placing equipment.
+  // 1. Update the floor with the plan image + scale. Walls + AI-detected
+  //    furniture are replaced by the new trace; devices are PRESERVED so
+  //    the user doesn't lose work if they re-run the survey after placing
+  //    equipment.
   store.updateFloor(floor.id, {
     planImage: planImageDataUrl,
     scale: survey.scalePxPerMeter,
     walls: [],
+    furniture: [],
   });
 
   // 2. Add proposed walls
@@ -96,5 +99,38 @@ export function applySurveyToActiveFloor(
     devicesAdded++;
   }
 
-  return { wallsAdded, devicesAdded };
+  // 4. Add proposed furniture (if any). Pure visualization — won't
+  //    affect coverage, BoM, or quote math.
+  let furnitureAdded = 0;
+  for (const f of survey.furniture ?? []) {
+    store.addFurniture(floor.id, {
+      type: f.type,
+      position: { x: f.x, y: f.y },
+      rotation: (f.rotationDegrees * Math.PI) / 180,
+      lengthM: f.lengthM,
+      widthM: f.widthM,
+      label: f.label || defaultFurnitureLabel(f.type),
+      notes: f.rationale,
+    });
+    furnitureAdded++;
+  }
+
+  return { wallsAdded, devicesAdded, furnitureAdded };
+}
+
+function defaultFurnitureLabel(type: string): string {
+  switch (type) {
+    case "conference-table":
+      return "Conference Table";
+    case "kitchen-island":
+      return "Kitchen Island";
+    case "desk":
+      return "Desk";
+    case "chair":
+      return "Chair";
+    case "sofa":
+      return "Sofa";
+    default:
+      return "Furniture";
+  }
 }

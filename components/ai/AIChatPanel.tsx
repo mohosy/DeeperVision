@@ -3,8 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  ArrowUpRight,
   Brain,
   Camera,
+  ChevronDown,
+  ChevronUp,
   DoorOpen,
   Eye,
   ExternalLink,
@@ -87,6 +90,17 @@ export function AIChatPanel() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   /**
+   * Image the user has attached to the next outbound message. Shown as a
+   * thumbnail above the composer; cleared on send (one-shot). A ref mirrors
+   * the state value so the `send` closure (created at click time) always
+   * reads the latest image without stale captures.
+   */
+  const [pendingImage, setPendingImage] = useState<
+    ChatMessage["attachedImage"] | null
+  >(null);
+  const pendingImageRef = useRef<ChatMessage["attachedImage"] | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /**
    * Live status for the busy indicator. Updates with each tool call so
    * the user sees the agent's narration in real time — "Searching the
    * web", "Placing camera", "Moving device", etc.
@@ -121,6 +135,43 @@ export function AIChatPanel() {
 
   function stop() {
     abortRef.current?.abort();
+  }
+
+  /** Read the chosen file as a data URL and stash it as the next message's
+   *  attachment. Anthropic vision accepts png/jpeg/webp/gif up to 5MB; we
+   *  reject anything outside that envelope before we even read it. */
+  function handlePickImage(file: File | null) {
+    if (!file) return;
+    const allowed = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+    if (!allowed.includes(file.type)) {
+      toast.error("Unsupported image type", {
+        description: "Use PNG, JPEG, WEBP, or GIF.",
+      });
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error("Image too large", {
+        description: "Keep attachments under 5 MB.",
+      });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      const next = {
+        dataUrl,
+        mediaType: file.type as NonNullable<ChatMessage["attachedImage"]>["mediaType"],
+      };
+      pendingImageRef.current = next;
+      setPendingImage(next);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearPendingImage() {
+    pendingImageRef.current = null;
+    setPendingImage(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   /**
@@ -220,9 +271,21 @@ export function AIChatPanel() {
   }
 
   async function send(text: string) {
-    if (!floor || !design || !text.trim() || busy) return;
+    if (!floor || !design || busy) return;
     const trimmed = text.trim();
-    const userMsg: ChatMessage = { role: "user", content: trimmed };
+    const img = pendingImageRef.current;
+    // Allow sending if there's either text or an attached image. Without
+    // either, the request is a no-op.
+    if (!trimmed && !img) return;
+    const userMsg: ChatMessage = {
+      role: "user",
+      content: trimmed,
+      ...(img ? { attachedImage: img } : {}),
+    };
+    // Image is one-shot — clear it on send so the next message doesn't
+    // accidentally re-attach.
+    pendingImageRef.current = null;
+    setPendingImage(null);
 
     const assistantSeed: ChatMessage = {
       role: "assistant",
@@ -233,6 +296,10 @@ export function AIChatPanel() {
     };
     setMessages((prev) => [...prev, userMsg, assistantSeed]);
     setInput("");
+    // Collapse the textarea back to single-line height now that input is
+    // cleared. The auto-grow handler only fires on user input, so without
+    // this reset the textarea would stay at its expanded send-time height.
+    if (inputRef.current) inputRef.current.style.height = "auto";
     setBusy(true);
     setActiveSearch(null);
     setStatus({ icon: "brain", label: "Thinking" });
@@ -374,35 +441,25 @@ export function AIChatPanel() {
 
   return (
     <div className="flex h-full w-full flex-col bg-sidebar">
-      {/* Subheader with title + Clear */}
-      <div className="flex items-center justify-between border-b border-border/70 px-4 py-2.5">
-        <div className="flex items-center gap-2 text-[0.82rem] font-medium tracking-[-0.005em] text-foreground/90">
-          <span className="relative flex size-5 items-center justify-center">
-            <Sparkles className="size-3.5 text-primary" strokeWidth={2} />
-          </span>
-          AI editor
-        </div>
-        <div className="flex items-center gap-1">
-          {messages.length > 0 && (
-            <button
-              type="button"
-              onClick={clear}
-              title="Clear conversation"
-              className="rounded-md px-1.5 py-0.5 text-[0.7rem] text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground"
-            >
-              Clear
-            </button>
-          )}
-        </div>
-      </div>
-
       {/* Live quote summary card — pricing, totals, and a "Print quote"
           button live INSIDE the chat so the user can discuss costs with
-          the agent without switching tabs. */}
+          the agent without switching tabs. Acts as the visual anchor at
+          the top of the panel since the AI tab strip already labels it. */}
       <InlineQuoteCard onOpenFullQuote={() => setQuoteOpen(true)} />
 
-      {/* Conversation */}
-      <div ref={listRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-2.5">
+      {/* Conversation — Clear floats as a ghost button in the top-right
+          rather than living in its own bordered subheader. */}
+      <div ref={listRef} className="relative flex-1 overflow-y-auto px-3 pb-3 pt-3 space-y-2.5">
+        {messages.length > 0 && (
+          <button
+            type="button"
+            onClick={clear}
+            title="Clear conversation"
+            className="absolute right-2 top-2 z-10 rounded-md bg-background/70 px-1.5 py-0.5 text-[0.65rem] font-medium text-muted-foreground backdrop-blur-sm hover:bg-foreground/[0.08] hover:text-foreground transition-colors"
+          >
+            Clear
+          </button>
+        )}
         {messages.length === 0 && !busy && (
           <EmptyState
             onPick={(prompt) => send(prompt)}
@@ -423,19 +480,65 @@ export function AIChatPanel() {
         )}
       </div>
 
-      {/* Composer */}
-      <div className="border-t border-border/70 bg-background/30 p-2.5">
+      {/* Composer — no top divider; the background tint + the input's own
+          card edge are enough to ground it. */}
+      <div className="bg-background/40 p-2.5">
+        {pendingImage && (
+          <div className="mb-2 inline-flex items-center gap-2 rounded-lg bg-card/80 ring-1 ring-border/40 p-1.5 pr-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={pendingImage.dataUrl}
+              alt="Attached"
+              className="size-10 rounded-md object-cover"
+            />
+            <div className="flex flex-col">
+              <span className="text-[0.7rem] font-medium text-foreground/90">
+                Image attached
+              </span>
+              <span className="text-[0.62rem] text-muted-foreground">
+                Sends with your next message
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={clearPendingImage}
+              title="Remove image"
+              aria-label="Remove attached image"
+              className="ml-1 flex size-5 items-center justify-center rounded-full text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+            >
+              <Trash2 className="size-3" strokeWidth={2} />
+            </button>
+          </div>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/webp,image/gif"
+          onChange={(e) => {
+            handlePickImage(e.target.files?.[0] ?? null);
+          }}
+          className="hidden"
+        />
         <form
           onSubmit={(e) => {
             e.preventDefault();
             send(input);
           }}
-          className="flex items-center gap-2 rounded-xl border border-border/70 bg-card px-2.5 py-1.5 shadow-[inset_0_1px_0_oklch(1_0_0/3%)] focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/15 transition-colors"
+          className="flex items-center gap-2 rounded-xl bg-card px-2.5 py-1.5 ring-1 ring-border/40 shadow-[0_1px_2px_-1px_oklch(0_0_0/8%)] focus-within:ring-2 focus-within:ring-primary/40 transition-shadow"
         >
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              // Auto-grow with content. Setting height to 'auto' first
+              // lets the textarea shrink when the user deletes lines;
+              // then we size to scrollHeight. The max-h-[120px] class
+              // caps the height — anything past that scrolls internally.
+              const el = e.target;
+              el.style.height = "auto";
+              el.style.height = `${el.scrollHeight}px`;
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -444,12 +547,23 @@ export function AIChatPanel() {
             }}
             rows={1}
             placeholder={
-              floor && floor.devices.length === 0
-                ? 'Try: "Add a dome camera at the front door"'
-                : "Ask, search, edit…"
+              pendingImage
+                ? "Describe what to do with this image (optional)…"
+                : floor && floor.devices.length === 0
+                  ? 'Try: "Add a dome camera at the front door"'
+                  : "Ask, search, edit…"
             }
             className="min-h-[20px] max-h-[120px] flex-1 resize-none bg-transparent text-[0.82rem] leading-relaxed outline-none placeholder:text-muted-foreground/60"
           />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach an image (floor plan, reference photo, etc.)"
+            aria-label="Attach image"
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <ImagePlus className="size-3.5" strokeWidth={2} />
+          </button>
           {busy ? (
             <button
               type="button"
@@ -463,7 +577,7 @@ export function AIChatPanel() {
           ) : (
             <button
               type="submit"
-              disabled={!input.trim() || !floor}
+              disabled={(!input.trim() && !pendingImage) || !floor}
               className="flex size-7 shrink-0 items-center justify-center rounded-md bg-foreground text-background transition-opacity hover:opacity-90 disabled:opacity-30"
               aria-label="Send"
             >
@@ -490,74 +604,107 @@ function EmptyState({
   onOpenSurvey: () => void;
   onOpenAdvisor: () => void;
 }) {
-  // Three hero starters that span the agent's range: audit, research,
-  // suggestion. Specific enough to be useful, generic enough to not look
-  // like the only thing the chat can do.
-  const starters = [
+  // Four hero starters that span the agent's range. Each chip carries a
+  // tint (icon color + gradient bg) so the list scans like a palette of
+  // capabilities rather than a wall of grey rows. The first one is the
+  // panel-opening "Analyze coverage" — marked `action: true` so the chip
+  // renders the up-right arrow (it opens UI, doesn't pre-fill text).
+  const starters: Array<{
+    Icon: React.ComponentType<{ className?: string; strokeWidth?: number }>;
+    text: string;
+    tint: ChipTint;
+    action?: boolean;
+    onClick?: () => void;
+  }> = [
     {
-      icon: <Wand2 className="size-3.5 text-amber-500" strokeWidth={1.8} />,
-      text: "Critique my current layout — what's missing?",
+      Icon: ShieldCheck,
+      text: "Analyze coverage",
+      tint: "emerald",
+      action: true,
+      onClick: onOpenAdvisor,
     },
     {
-      icon: <Globe className="size-3.5 text-sky-500" strokeWidth={1.8} />,
+      Icon: Wand2,
+      text: "Critique my layout. What's missing?",
+      tint: "amber",
+    },
+    {
+      Icon: Globe,
       text: "Find a 4K dome camera under $300 and add 4 of them.",
+      tint: "sky",
     },
     {
-      icon: <Lightbulb className="size-3.5 text-violet-500" strokeWidth={1.8} />,
+      Icon: Lightbulb,
       text: "Suggest where I should put cameras in the conference room.",
+      tint: "violet",
     },
   ];
-  const moreIdeas = [
+  const moreIdeas: Array<{
+    Icon: React.ComponentType<{ className?: string; strokeWidth?: number }>;
+    text: string;
+    tint: ChipTint;
+  }> = [
     {
-      icon: <Camera className="size-3.5" strokeWidth={1.8} />,
+      Icon: Camera,
       text: "Add a dome camera at every corner of the largest room.",
+      tint: "indigo",
     },
     {
-      icon: <MousePointer2 className="size-3.5 text-indigo-500" strokeWidth={1.8} />,
+      Icon: MousePointer2,
       text: "Move the lobby camera so it faces the front door.",
+      tint: "indigo",
     },
     {
-      icon: <Receipt className="size-3.5 text-teal-500" strokeWidth={1.8} />,
+      Icon: Receipt,
       text: "Look up local permit costs and add them to my quote.",
+      tint: "teal",
     },
     {
-      icon: <StickyNote className="size-3.5 text-yellow-500" strokeWidth={1.8} />,
+      Icon: StickyNote,
       text: "Pin a warning at every door without a reader.",
+      tint: "yellow",
     },
     {
-      icon: <Plus className="size-3.5 text-emerald-500" strokeWidth={1.8} />,
+      Icon: Plus,
       text: "Cover every door with a motion sensor.",
+      tint: "emerald",
     },
     {
-      icon: <Eye className="size-3.5 text-rose-500" strokeWidth={1.8} />,
-      text: "Show me the POV of the front-door camera.",
+      Icon: Eye,
+      text: "Show me the POV of the front door camera.",
+      tint: "rose",
     },
   ];
   const [moreOpen, setMoreOpen] = useState(false);
   return (
-    <div className="flex flex-col items-center gap-4 pt-4 px-1 text-center">
-      <div className="relative">
-        <div className="absolute inset-0 animate-ping rounded-2xl bg-primary/20" />
-        <div className="relative flex size-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-          <Sparkles className="size-5" />
-        </div>
+    <div className="flex flex-col items-center gap-5 pt-4 px-1 text-center">
+      {/* Animated glow behind the spark icon — gives the empty state a
+          subtle pulse so it feels alive even before the user types. */}
+      <div className="relative flex size-12 items-center justify-center">
+        <span className="absolute inset-0 rounded-2xl bg-primary/15 blur-md animate-pulse" />
+        <span className="relative flex size-12 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/20 to-primary/5 text-primary ring-1 ring-primary/20">
+          <Sparkles className="size-5" strokeWidth={1.8} />
+        </span>
       </div>
       <div className="space-y-1">
-        <div className="text-[0.9rem] font-medium tracking-[-0.01em]">
+        <div className="text-[0.95rem] font-semibold tracking-[-0.015em] text-foreground">
           What should we change?
         </div>
         <div className="mx-auto max-w-[20rem] text-[0.72rem] text-muted-foreground leading-relaxed">
-          I can add, move, rotate, remove devices — and search the web for
-          product specs or pricing.
+          I can add, move, rotate, and remove devices, plus search the web
+          for product specs or pricing.
         </div>
       </div>
-      <div className="grid w-full gap-1.5">
+      <div className="grid w-full gap-2">
         {starters.map((s, i) => (
           <SuggestionChip
             key={i}
-            icon={s.icon}
+            Icon={s.Icon}
             text={s.text}
+            tint={s.tint}
+            action={s.action}
             onPick={onPick}
+            onClick={s.onClick}
           />
         ))}
       </div>
@@ -565,66 +712,154 @@ function EmptyState({
       <button
         type="button"
         onClick={() => setMoreOpen((v) => !v)}
-        className="-mt-1 inline-flex items-center gap-1 text-[0.7rem] font-medium text-muted-foreground hover:text-foreground transition-colors"
+        className="-mt-1 inline-flex items-center gap-1 rounded-full bg-foreground/[0.04] px-2.5 py-1 text-[0.7rem] font-medium text-muted-foreground hover:bg-foreground/[0.08] hover:text-foreground transition-colors"
       >
         {moreOpen ? "Hide ideas" : "More ideas"}
-        <span className="opacity-60">{moreOpen ? "▴" : "▾"}</span>
+        {moreOpen ? (
+          <ChevronUp className="size-3 opacity-70" strokeWidth={2.2} />
+        ) : (
+          <ChevronDown className="size-3 opacity-70" strokeWidth={2.2} />
+        )}
       </button>
 
       {moreOpen && (
-        <div className="grid w-full gap-1.5">
+        <div className="grid w-full gap-2">
           {moreIdeas.map((s, i) => (
             <SuggestionChip
               key={i}
-              icon={s.icon}
+              Icon={s.Icon}
               text={s.text}
+              tint={s.tint}
               onPick={onPick}
             />
           ))}
         </div>
       )}
 
-      <div className="mt-1 grid w-full grid-cols-2 gap-1.5 border-t border-border/40 pt-3">
-        <button
-          type="button"
-          onClick={onOpenSurvey}
-          title="Generate walls from a floor-plan image"
-          className="flex items-center justify-center gap-1.5 rounded-lg border border-border/60 bg-card/60 px-2 py-2 text-[0.7rem] text-foreground/80 hover:border-primary/40 hover:bg-primary/[0.04] transition-colors"
-        >
-          <ImagePlus className="size-3.5 text-sky-500" strokeWidth={1.9} />
-          From plan image
-        </button>
-        <button
-          type="button"
-          onClick={onOpenAdvisor}
-          title="Run a coverage analysis on the current design"
-          className="flex items-center justify-center gap-1.5 rounded-lg border border-border/60 bg-card/60 px-2 py-2 text-[0.7rem] text-foreground/80 hover:border-primary/40 hover:bg-primary/[0.04] transition-colors"
-        >
-          <ShieldCheck className="size-3.5 text-emerald-500" strokeWidth={1.9} />
-          Analyze coverage
-        </button>
-      </div>
     </div>
   );
 }
 
+/* ── Suggestion chips ─────────────────────────────────────────────────── */
+
+/** Per-chip color tint. Drives the icon's gradient box + the chip's
+ *  hover halo. Kept as a closed set so it can't drift over time. */
+type ChipTint =
+  | "amber"
+  | "emerald"
+  | "sky"
+  | "violet"
+  | "indigo"
+  | "teal"
+  | "yellow"
+  | "rose";
+
+const CHIP_TINTS: Record<
+  ChipTint,
+  { iconBg: string; iconColor: string; hoverHalo: string }
+> = {
+  amber: {
+    iconBg: "from-amber-500/20 to-amber-500/5",
+    iconColor: "text-amber-600 dark:text-amber-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.72_0.18_70/45%)]",
+  },
+  emerald: {
+    iconBg: "from-emerald-500/20 to-emerald-500/5",
+    iconColor: "text-emerald-600 dark:text-emerald-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.7_0.18_150/45%)]",
+  },
+  sky: {
+    iconBg: "from-sky-500/20 to-sky-500/5",
+    iconColor: "text-sky-600 dark:text-sky-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.7_0.18_230/45%)]",
+  },
+  violet: {
+    iconBg: "from-violet-500/20 to-violet-500/5",
+    iconColor: "text-violet-600 dark:text-violet-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.65_0.22_290/45%)]",
+  },
+  indigo: {
+    iconBg: "from-indigo-500/20 to-indigo-500/5",
+    iconColor: "text-indigo-600 dark:text-indigo-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.6_0.22_265/45%)]",
+  },
+  teal: {
+    iconBg: "from-teal-500/20 to-teal-500/5",
+    iconColor: "text-teal-600 dark:text-teal-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.7_0.16_185/45%)]",
+  },
+  yellow: {
+    iconBg: "from-yellow-500/25 to-yellow-500/5",
+    iconColor: "text-yellow-600 dark:text-yellow-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.85_0.16_95/45%)]",
+  },
+  rose: {
+    iconBg: "from-rose-500/20 to-rose-500/5",
+    iconColor: "text-rose-600 dark:text-rose-400",
+    hoverHalo: "hover:shadow-[0_6px_20px_-8px_oklch(0.7_0.2_15/45%)]",
+  },
+};
+
+/**
+ * Suggestion chip — a richer "starter prompt" card with a tinted icon
+ * box on the left, the prompt text, and a hover affordance that lifts
+ * + glows in the chip's tint color. No grey border (it would just add
+ * another horizontal line); the lift comes from a soft drop-shadow and
+ * a faint inset highlight.
+ */
 function SuggestionChip({
-  icon,
+  Icon,
   text,
+  tint,
   onPick,
+  onClick,
+  /** When true, the chip renders an up-right arrow instead of the
+   *  "send" arrow, signaling that it opens UI rather than pre-filling
+   *  the composer. Used by "Analyze coverage" for example. */
+  action,
 }: {
-  icon: React.ReactNode;
+  Icon: React.ComponentType<{ className?: string; strokeWidth?: number }>;
   text: string;
+  tint: ChipTint;
   onPick: (text: string) => void;
+  onClick?: () => void;
+  action?: boolean;
 }) {
+  const t = CHIP_TINTS[tint];
   return (
     <button
       type="button"
-      onClick={() => onPick(text)}
-      className="flex items-start gap-2 rounded-lg border border-border/60 bg-card/60 px-2.5 py-1.5 text-left text-[0.74rem] text-foreground/85 hover:border-primary/40 hover:bg-primary/[0.04] transition-colors"
+      onClick={onClick ?? (() => onPick(text))}
+      className={cn(
+        "group relative flex w-full items-center gap-2.5 overflow-hidden rounded-xl bg-gradient-to-br from-card to-card/60 px-2.5 py-2 text-left text-[0.78rem] font-medium leading-snug text-foreground/90",
+        "shadow-[0_1px_2px_-1px_oklch(0_0_0/6%),inset_0_1px_0_oklch(1_0_0/4%)]",
+        "transition-[transform,box-shadow] duration-200 ease-out",
+        "hover:-translate-y-px",
+        t.hoverHalo,
+      )}
     >
-      <span className="mt-0.5 text-primary/80">{icon}</span>
-      <span>{text}</span>
+      {/* Tinted icon box. Pops slightly on hover for a touch of life. */}
+      <span
+        className={cn(
+          "flex size-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br",
+          t.iconBg,
+          "transition-transform duration-200 group-hover:scale-[1.08]",
+        )}
+      >
+        <Icon className={cn("size-4", t.iconColor)} strokeWidth={1.9} />
+      </span>
+
+      <span className="min-w-0 flex-1 pr-1">{text}</span>
+
+      {/* Trailing arrow — fades in on hover so the chip stays clean
+          at rest. Up-right for "action" chips, regular up for prompts. */}
+      <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-foreground/[0.04] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
+        {action ? (
+          <ArrowUpRight className="size-3" strokeWidth={2.2} />
+        ) : (
+          <ArrowUp className="size-3" strokeWidth={2.2} />
+        )}
+      </span>
     </button>
   );
 }
@@ -751,8 +986,20 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
     // light vs dark themes for a tasteful inverted look.
     return (
       <div className="flex justify-end">
-        <div className="max-w-[88%] rounded-2xl rounded-br-sm bg-foreground px-2.5 py-1.5 text-[0.8rem] leading-relaxed text-background shadow-[0_2px_8px_-3px_oklch(0_0_0/35%)]">
-          {msg.content}
+        <div className="flex max-w-[88%] flex-col items-end gap-1.5">
+          {msg.attachedImage && (
+            /* eslint-disable-next-line @next/next/no-img-element */
+            <img
+              src={msg.attachedImage.dataUrl}
+              alt="Attached"
+              className="max-h-48 rounded-xl rounded-br-sm object-cover shadow-[0_2px_8px_-3px_oklch(0_0_0/35%)]"
+            />
+          )}
+          {msg.content && (
+            <div className="rounded-2xl rounded-br-sm bg-foreground px-2.5 py-1.5 text-[0.8rem] leading-relaxed text-background shadow-[0_2px_8px_-3px_oklch(0_0_0/35%)]">
+              {msg.content}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -765,7 +1012,7 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
         </div>
         <div className="min-w-0 flex-1 space-y-1.5">
           {msg.content && (
-            <div className="rounded-2xl rounded-tl-sm border border-border/60 bg-card/60 px-2.5 py-1.5 text-[0.8rem] leading-relaxed text-foreground/90 whitespace-pre-wrap">
+            <div className="rounded-2xl rounded-tl-sm bg-card/80 px-2.5 py-1.5 text-[0.8rem] leading-relaxed text-foreground/90 whitespace-pre-wrap shadow-[0_1px_3px_-1px_oklch(0_0_0/8%),inset_0_0_0_1px_oklch(0_0_0/4%)]">
               {renderInlineMarkdown(msg.content)}
             </div>
           )}
@@ -783,16 +1030,135 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
             </div>
           )}
           {msg.operations && msg.operations.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {msg.operations.map((op, i) => (
-                <OperationChip key={i} op={op} />
-              ))}
-            </div>
+            <OperationsList ops={msg.operations} />
           )}
         </div>
       </div>
     </div>
   );
+}
+
+/**
+ * Renders an assistant message's operation pills. Groups ops by kind so a
+ * 60-wall rebuild doesn't flood the chat with 60 pills — instead you see
+ * one summary chip ("× 60 walls") with a chevron; click it to expand.
+ * Single ops render as before (their describe text reads as a complete
+ * sentence, which the summary form loses).
+ */
+function OperationsList({ ops }: { ops: ChatOperation[] }) {
+  // Group consecutive same-kind ops so the order Claude issued them in
+  // is preserved on screen. (A mixed sequence like add×5, remove×3,
+  // add×4 renders as three groups in order, not two merged groups.)
+  const groups: { kind: ChatOperation["kind"]; ops: ChatOperation[] }[] = [];
+  for (const op of ops) {
+    const last = groups[groups.length - 1];
+    if (last && last.kind === op.kind) last.ops.push(op);
+    else groups.push({ kind: op.kind, ops: [op] });
+  }
+
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const toggle = (i: number) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {groups.map((g, gi) => {
+        if (g.ops.length === 1) {
+          return <OperationChip key={gi} op={g.ops[0]} />;
+        }
+        const isOpen = expanded.has(gi);
+        if (isOpen) {
+          return (
+            <span
+              key={gi}
+              className="inline-flex flex-wrap items-center gap-1 rounded-md bg-zinc-500/5 px-1 py-0.5 ring-1 ring-zinc-500/15"
+            >
+              {g.ops.map((op, i) => (
+                <OperationChip key={i} op={op} />
+              ))}
+              <button
+                type="button"
+                onClick={() => toggle(gi)}
+                title="Collapse"
+                className="inline-flex items-center gap-1 rounded-md bg-zinc-500/10 px-1.5 py-0.5 text-[0.66rem] font-medium text-zinc-700 ring-1 ring-zinc-500/25 hover:bg-zinc-500/20 dark:text-zinc-300"
+              >
+                <ChevronUp className="size-2.5" strokeWidth={2.4} />
+                Collapse
+              </button>
+            </span>
+          );
+        }
+        const { tone, Icon } = chipStyleFor(g.ops[0]);
+        const summary = groupSummary(g.kind, g.ops.length);
+        return (
+          <button
+            key={gi}
+            type="button"
+            onClick={() => toggle(gi)}
+            title={`${g.ops.length} ${g.kind} ops — click to expand`}
+            className={cn(
+              "inline-flex max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-[0.68rem] font-medium ring-1 hover:brightness-110",
+              tone,
+            )}
+          >
+            <Icon className="size-2.5 shrink-0" strokeWidth={2.4} />
+            <span className="truncate">{summary}</span>
+            <ChevronDown className="size-2.5 shrink-0 opacity-70" strokeWidth={2.4} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Short summary label for a group of N same-kind operations. Used by the
+ * collapsed group chip.
+ */
+function groupSummary(kind: ChatOperation["kind"], n: number): string {
+  switch (kind) {
+    case "add-device":
+      return `+ ${n} devices`;
+    case "remove-device":
+      return `× ${n} devices`;
+    case "move-device":
+      return `→ moved ${n}`;
+    case "rotate-device":
+      return `↻ rotated ${n}`;
+    case "update-device":
+      return `✎ updated ${n}`;
+    case "add-wall":
+      return `+ ${n} walls`;
+    case "remove-wall":
+      return `× ${n} walls`;
+    case "add-door":
+      return `+ ${n} doors`;
+    case "set-floor-scale":
+      return `↻ scale (${n}×)`;
+    case "add-annotation":
+      return `+ ${n} notes`;
+    case "remove-annotation":
+      return `× ${n} notes`;
+    case "add-quote-line-item":
+      return `+ ${n} quote lines`;
+    case "remove-quote-line-item":
+      return `× ${n} quote lines`;
+    case "update-quote-settings":
+      return `↻ quote (${n}×)`;
+    case "view-from-camera":
+      return `👁 POV (${n}×)`;
+    case "set-view-mode":
+      return `→ view (${n}×)`;
+    case "set-door-lock":
+      return `🔒 ${n} locks`;
+    default:
+      return `${kind} × ${n}`;
+  }
 }
 
 function OperationChip({ op }: { op: ChatOperation }) {
@@ -919,6 +1285,11 @@ function chipStyleFor(op: ChatOperation): {
         tone: "bg-amber-500/12 text-amber-700 dark:text-amber-300 ring-amber-500/25",
         Icon: WandSparkles,
       };
+    case "set-door-lock":
+      return {
+        tone: "bg-slate-500/12 text-slate-700 dark:text-slate-300 ring-slate-500/25",
+        Icon: ShieldCheck,
+      };
     case "add-wall":
       return {
         tone: "bg-emerald-600/12 text-emerald-700 dark:text-emerald-300 ring-emerald-600/30",
@@ -993,10 +1364,37 @@ function CitationChip({ citation }: { citation: Citation }) {
       title={citation.title ?? citation.url}
       className="inline-flex max-w-[220px] items-center gap-1 rounded-md bg-foreground/[0.04] px-1.5 py-0.5 text-[0.66rem] font-medium text-foreground/75 ring-1 ring-foreground/15 hover:bg-foreground/[0.08] hover:text-foreground transition-colors"
     >
-      <Globe className="size-2.5 shrink-0 text-sky-500" strokeWidth={2.4} />
+      <CitationFavicon host={host} />
       <span className="truncate">{host}</span>
       <ExternalLink className="size-2 shrink-0 opacity-60" strokeWidth={2.4} />
     </a>
+  );
+}
+
+/**
+ * Renders the cited site's real favicon (via Google's S2 favicon service)
+ * with a graceful fallback to the generic Globe icon if the favicon fails
+ * to load (offline, blocked, or no favicon at the host). The Globe was the
+ * previous default and is still a fine "this is a web source" affordance.
+ */
+function CitationFavicon({ host }: { host: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed || !host) {
+    return (
+      <Globe className="size-2.5 shrink-0 text-sky-500" strokeWidth={2.4} />
+    );
+  }
+  return (
+    /* eslint-disable-next-line @next/next/no-img-element */
+    <img
+      src={`https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`}
+      alt=""
+      width={12}
+      height={12}
+      onError={() => setFailed(true)}
+      className="size-3 shrink-0 rounded-[2px]"
+      loading="lazy"
+    />
   );
 }
 

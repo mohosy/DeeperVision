@@ -1,11 +1,15 @@
 "use client";
 
 import { useMemo } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
   CheckCircle2,
+  Eye,
+  EyeOff,
   Pause,
   Play,
+  Radio,
   RotateCcw,
   ShieldAlert,
   X,
@@ -29,9 +33,30 @@ export function SimView() {
     <div className="relative h-full w-full overflow-hidden">
       <Scene3D showSim />
       <SimControls />
-      <DetectionFeed />
+      <FollowExitButton />
       <AfterActionReport />
     </div>
+  );
+}
+
+/**
+ * Top-right pill that surfaces only when the camera is locked into the
+ * actor's first-person follow mode. Lets the user pop back to orbit
+ * without having to mouse-hunt for the 3D scene's other controls.
+ */
+function FollowExitButton() {
+  const following = useSimStore((s) => s.following);
+  const stopFollow = useSimStore((s) => s.stopFollow);
+  if (!following) return null;
+  return (
+    <button
+      type="button"
+      onClick={stopFollow}
+      className="pointer-events-auto absolute right-3 top-3 z-30 inline-flex items-center gap-1.5 rounded-full bg-foreground px-3 py-1.5 text-[0.78rem] font-medium text-background shadow-lg hover:bg-foreground/85"
+    >
+      <X className="size-3.5" strokeWidth={2.2} />
+      Exit follow
+    </button>
   );
 }
 
@@ -153,51 +178,113 @@ function SimControls() {
   );
 }
 
+/**
+ * Slim cinematic HUD at the top of the sim scene. Replaces the old chunky
+ * top-right popup. Two pieces, side-by-side:
+ *
+ *  • Tracking badge — pulsing red dot + "N TRACKING" / "BLIND" depending on
+ *    live state. Snaps the user's eye to coverage status at any moment.
+ *  • Event ticker — the three most recent events render as small chips
+ *    that slide IN from the right and AGE OUT to the left. Framer Motion
+ *    handles the slide + fade, so events flow like a stock ticker.
+ *
+ * Everything 3D-related is handled by DetectionVisualizer3D + the camera
+ * pulses + the actor aura, so this overlay can stay deliberately minimal.
+ */
 function DetectionFeed() {
   const events = useSimStore((s) => s.events);
+  const detectingCameras = useSimStore((s) => s.detectingCameras);
+  const triggeredSensors = useSimStore((s) => s.triggeredSensors);
+  const running = useSimStore((s) => s.running);
   const floor = useActiveFloor();
-  if (events.length === 0) return null;
-  const recent = events.slice(-8).reverse();
+
+  const trackingCount = detectingCameras.size + triggeredSensors.size;
+  // The latest few events ride the ticker. Reverse so newest is leftmost.
+  const recent = events.slice(-3).reverse();
+
+  if (!running && events.length === 0) return null;
+
   return (
-    <div className="pointer-events-none absolute right-4 top-4 z-30 w-72 space-y-1.5">
-      <div className="rounded-lg border border-border bg-card/85 px-3 py-2 backdrop-blur">
-        <div className="mb-2 flex items-center justify-between">
-          <div className="text-[0.65rem] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-            Live detection feed
-          </div>
-          <span className="font-mono text-[0.65rem] text-muted-foreground">
-            {events.length}
-          </span>
-        </div>
-        <div className="space-y-1">
-          {recent.map((ev, idx) => {
+    <div className="pointer-events-none absolute left-1/2 top-14 z-30 flex -translate-x-1/2 items-center gap-2">
+      {/* Tracking status pill */}
+      <motion.div
+        layout
+        className={cn(
+          "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[0.74rem] font-medium backdrop-blur-xl ring-1 transition-colors",
+          trackingCount > 0
+            ? "bg-rose-500/15 text-rose-50 ring-rose-500/40 shadow-[0_10px_30px_-12px_rgba(244,63,94,0.6)]"
+            : "bg-background/65 text-muted-foreground ring-black/[0.06] dark:ring-white/[0.06]",
+        )}
+      >
+        {trackingCount > 0 ? (
+          <>
+            <span className="relative flex size-2">
+              <span className="absolute inline-flex size-full animate-ping rounded-full bg-rose-400 opacity-75" />
+              <span className="relative inline-flex size-2 rounded-full bg-rose-400" />
+            </span>
+            <Radio className="size-3.5" strokeWidth={2} />
+            <span className="tabular-nums">
+              {trackingCount} tracking
+            </span>
+          </>
+        ) : (
+          <>
+            <EyeOff className="size-3.5" strokeWidth={1.8} />
+            <span>Blind</span>
+          </>
+        )}
+      </motion.div>
+
+      {/* Event ticker — latest detections flow in from the right and age out
+          to the left. Keyed by event identity so AnimatePresence knows
+          which chips are new. */}
+      <div className="flex items-center gap-1.5">
+        <AnimatePresence initial={false}>
+          {recent.map((ev) => {
             const device = floor?.devices.find((d) => d.id === ev.deviceId);
             const tone =
               ev.type === "detected"
-                ? "text-emerald-400"
+                ? {
+                    icon: <Eye className="size-3" strokeWidth={2.2} />,
+                    label: "saw",
+                    cls: "bg-emerald-500/20 text-emerald-100 ring-emerald-500/40",
+                  }
                 : ev.type === "lost"
-                  ? "text-amber-400"
-                  : "text-rose-400";
+                  ? {
+                      icon: <EyeOff className="size-3" strokeWidth={2} />,
+                      label: "lost",
+                      cls: "bg-amber-500/20 text-amber-100 ring-amber-500/40",
+                    }
+                  : {
+                      icon: <Radio className="size-3" strokeWidth={2.2} />,
+                      label: "triggered",
+                      cls: "bg-rose-500/20 text-rose-100 ring-rose-500/40",
+                    };
             return (
-              <div
-                key={`${ev.deviceId}-${idx}-${ev.timestamp}`}
-                className="flex items-baseline gap-2 text-[0.78rem]"
+              <motion.div
+                key={`${ev.deviceId}-${ev.timestamp}-${ev.type}`}
+                layout
+                initial={{ opacity: 0, x: 32, scale: 0.85 }}
+                animate={{ opacity: 1, x: 0, scale: 1 }}
+                exit={{ opacity: 0, x: -16, scale: 0.85 }}
+                transition={{ duration: 0.28, ease: [0.2, 0.7, 0.3, 1] }}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.7rem] font-medium backdrop-blur-xl ring-1",
+                  tone.cls,
+                )}
               >
-                <span className="font-mono text-[0.7rem] text-muted-foreground">
+                {tone.icon}
+                <span className="font-mono tabular-nums opacity-80">
                   {ev.timestamp.toFixed(1)}s
                 </span>
-                <span className={cn("font-medium", tone)}>
-                  {ev.type === "detected" && "detected"}
-                  {ev.type === "lost" && "lost"}
-                  {ev.type === "triggered" && "triggered"}
-                </span>
-                <span className="truncate text-muted-foreground">
+                <span className="opacity-90">{tone.label}</span>
+                <span className="max-w-[110px] truncate opacity-95">
                   {device?.label ?? ev.deviceId}
                 </span>
-              </div>
+              </motion.div>
             );
           })}
-        </div>
+        </AnimatePresence>
       </div>
     </div>
   );

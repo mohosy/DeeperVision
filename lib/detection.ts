@@ -113,6 +113,25 @@ export function computeDetection({
     const halfFov = (cam.fovDegrees / 2) * (Math.PI / 180);
     if (cosAngle < Math.cos(halfFov)) continue;
 
+    // Vertical check — only enforced when the camera has an explicit tilt
+    // set, so the default (level) behavior is unchanged. Compares the
+    // camera's pitch direction against the angle to the actor's center
+    // (chest height ~0.85m above floor); a tilt that aims the camera
+    // away from that angle by more than its vertical half-FOV misses.
+    const tilt = cam.tilt;
+    if (tilt != null && tilt !== 0) {
+      const ACTOR_BODY_Y = 0.85;
+      const verticalDrop = cam.mountHeight - ACTOR_BODY_Y;
+      // Angle BELOW horizontal at which the actor sits, from camera POV.
+      // distM > 0 here because we'd have hit the toActorLen===0 case above.
+      const angleToActor = Math.atan2(verticalDrop, distM);
+      // Surveillance cameras typically have a wide vertical FOV — use a
+      // generous floor so narrow-lens (PTZ) cameras don't accidentally
+      // become impossibly picky just because they have low fovDegrees.
+      const halfVerticalFov = Math.max(halfFov, (25 * Math.PI) / 180);
+      if (Math.abs(angleToActor - tilt) > halfVerticalFov) continue;
+    }
+
     if (!lineOfSight(cam.position, actorPosition, walls)) continue;
     detectingCameras.add(cam.id);
   }

@@ -73,17 +73,25 @@ function SingleFOV({
   const pz = camera.position.y / scale;
   const color = detecting ? "#34d399" : "#fde68a";
   const opacity = detecting ? 0.42 : 0.18;
+  // Inherit the device's pitch (tilt) so the FOV wedge visibly aims
+  // up/down in 3D space. The yaw spins it horizontally as before.
+  // Anchor the wedge at the camera's actual mount height when tilt is
+  // non-zero so it pivots in the correct world location.
+  const tilt = camera.tilt ?? 0;
+  const anchorY = tilt !== 0 ? camera.mountHeight : 0.04;
 
   return (
-    <group position={[px, 0.04, pz]} rotation={[0, -camera.rotation, 0]}>
-      <mesh geometry={geometry}>
-        <meshBasicMaterial
-          color={color}
-          transparent
-          opacity={opacity}
-          depthWrite={false}
-        />
-      </mesh>
+    <group position={[px, anchorY, pz]} rotation={[0, -camera.rotation, 0]}>
+      <group rotation={[0, 0, tilt]}>
+        <mesh geometry={geometry}>
+          <meshBasicMaterial
+            color={color}
+            transparent
+            opacity={opacity}
+            depthWrite={false}
+          />
+        </mesh>
+      </group>
     </group>
   );
 }

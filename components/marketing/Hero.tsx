@@ -15,14 +15,13 @@ import { LogoMark } from "@/components/branding/Logo";
 
 /** Each word gets a slightly later delay for the cascade effect */
 const WORDS: { text: string; italic?: boolean }[][] = [
-  [{ text: "Design" }, { text: "security" }, { text: "systems" }],
+  [{ text: "Design" }, { text: "buildings" }],
   [
-    { text: "the" },
-    { text: "way" },
     { text: "you" },
-    { text: "actually", italic: true },
+    { text: "can" },
+    { text: "walk", italic: true },
+    { text: "through." },
   ],
-  [{ text: "experience" }, { text: "them." }],
 ];
 
 export function Hero() {
@@ -116,7 +115,7 @@ export function Hero() {
       />
 
       {/* Content */}
-      <div className="relative z-10 flex flex-col items-center px-6 pt-36 pb-10 sm:pt-40">
+      <div className="relative z-10 flex flex-col items-center px-6 pt-24 pb-10 sm:pt-28">
         {/* ── Headline — word-by-word cascade ── */}
         <h1
           className="max-w-4xl text-center text-slate-900 text-[2.75rem] leading-[1.08] font-bold sm:text-[4rem] md:text-[4.8rem]"
@@ -151,7 +150,7 @@ export function Hero() {
 
         {/* ── CTA button ── */}
         <div
-          className="mt-10"
+          className="mt-7"
           style={{
             opacity: 0,
             animation:
@@ -160,16 +159,33 @@ export function Hero() {
         >
           <Link
             href="/design/new"
-            className="group relative inline-flex items-center gap-2 overflow-hidden rounded-full bg-slate-900 px-6 py-3 text-[0.95rem] font-medium text-white shadow-[0_8px_30px_-12px_rgba(0,0,0,0.3)] transition-all hover:bg-slate-800 hover:shadow-[0_12px_36px_-12px_rgba(0,0,0,0.4)]"
+            className={[
+              // Layered glass: a soft frosted gradient base, a brighter
+              // top highlight, a subtle inner ring, and a glow on hover.
+              "group relative inline-flex items-center gap-2 overflow-hidden",
+              "rounded-full px-7 py-3.5 text-[1rem] font-medium text-slate-900",
+              "bg-gradient-to-b from-white/55 to-white/20",
+              "backdrop-blur-2xl backdrop-saturate-150",
+              "border border-white/60 ring-1 ring-inset ring-white/40",
+              "shadow-[inset_0_1px_0_rgba(255,255,255,0.85),inset_0_-1px_0_rgba(15,23,42,0.06),0_18px_50px_-18px_rgba(15,23,42,0.35)]",
+              "transition-all duration-300",
+              "hover:from-white/70 hover:to-white/30 hover:scale-[1.02]",
+              "hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.95),inset_0_-1px_0_rgba(15,23,42,0.08),0_24px_60px_-18px_rgba(15,23,42,0.45)]",
+            ].join(" ")}
           >
-            <span>Open the editor</span>
-            <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+            {/* Animated specular highlight that drifts across on hover */}
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/45 to-transparent transition-transform duration-700 ease-out group-hover:translate-x-full"
+            />
+            <span className="relative">Open the editor</span>
+            <ArrowRight className="relative size-4 transition-transform duration-300 group-hover:translate-x-0.5" />
           </Link>
         </div>
 
         {/* ── Product mockup — macOS window frame ── */}
         <div
-          className="relative mt-10 w-full max-w-5xl sm:mt-12"
+          className="relative mt-7 w-full max-w-5xl sm:mt-9"
           style={{
             opacity: 0,
             animation:

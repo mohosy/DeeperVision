@@ -5,13 +5,19 @@ import Link from "next/link";
 import {
   Banknote,
   ChevronDown,
+  Compass,
+  Eye,
+  EyeOff,
   FileDown,
   FileSpreadsheet,
   FileText,
+  Images,
   Settings,
+  ShieldCheck,
   Sparkles,
   Upload,
 } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { LogoMark } from "@/components/branding/Logo";
 import { useDesignStore, useCurrentDesign, useActiveFloor } from "@/lib/store";
 import { Button } from "@/components/ui/button";
@@ -91,21 +97,29 @@ export function TopBar() {
         <ModeSwitcher />
 
         <div className="flex flex-1 items-center justify-end gap-1">
+          {/* Show-coverage toggle. Lives here (not just in the 2D toolbar)
+              so users in 3D/Sim can also flip camera FOV cones + sensor
+              rings on/off without changing modes. */}
+          <CoverageToggle />
+
           {/* AI chat tab toggle (no dropdown, no kbd hint). */}
           <AIMenu />
 
           {/* Single combined Project menu — replaces File + Export.
               Holds save, import, and every export option (PDF, BoM CSV,
               device schedule CSV, dvjson). */}
-          <ProjectMenu
-            design={design}
-            floor={floor}
-            quoteSettings={quoteSettings}
-            onImport={() => fileInputRef.current?.click()}
-            onSaveJson={exportJSON}
-          />
+          <span data-tour="project-menu" className="inline-flex">
+            <ProjectMenu
+              design={design}
+              floor={floor}
+              quoteSettings={quoteSettings}
+              onImport={() => fileInputRef.current?.click()}
+              onSaveJson={exportJSON}
+            />
+          </span>
 
           <Button
+            data-tour="quote"
             size="sm"
             className="btn-lift ml-1 bg-primary text-primary-foreground hover:bg-primary/90 shadow-[inset_0_1px_0_oklch(1_0_0/14%),0_4px_14px_-6px_oklch(0.78_0.135_158/50%)]"
             onClick={() => setQuoteOpen(true)}
@@ -142,6 +156,37 @@ export function TopBar() {
  * No dropdown, no flyout. Survey and Advisor are accessible from inside
  * the chat's empty state ("From plan image" / "Analyze coverage" buttons).
  */
+
+/**
+ * Top-bar chip that toggles camera FOV cones + sensor rings on the
+ * canvas. Mirrors the 2D toolbar button so users in 3D / Sim also have
+ * a one-click way to hide coverage when they want a clean view.
+ */
+function CoverageToggle() {
+  const showCoverage = useDesignStore((s) => s.showCoverage);
+  const toggleCoverage = useDesignStore((s) => s.toggleCoverage);
+  return (
+    <button
+      type="button"
+      onClick={toggleCoverage}
+      title={showCoverage ? "Hide camera coverage" : "Show camera coverage"}
+      className={cn(
+        "inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[0.78rem] font-medium transition-colors",
+        showCoverage
+          ? "text-foreground hover:bg-foreground/[0.04]"
+          : "text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]",
+      )}
+    >
+      {showCoverage ? (
+        <Eye className="size-3.5" strokeWidth={1.8} />
+      ) : (
+        <EyeOff className="size-3.5" strokeWidth={1.8} />
+      )}
+      <span>Coverage</span>
+    </button>
+  );
+}
+
 function AIMenu() {
   const rightTab = useDesignStore((s) => s.rightTab);
   const setRightTab = useDesignStore((s) => s.setRightTab);
@@ -210,6 +255,46 @@ function ProjectMenu({
     await exportDeviceScheduleCSV(design, floor);
     toast.success("Device schedule exported");
   }
+  async function exportPermitPackage() {
+    if (!design || !floor) return;
+    toast.info("Generating permit package…", { duration: 4000 });
+    const { exportPermitPackagePDF } = await import("@/lib/export");
+    await exportPermitPackagePDF(design, floor, {
+      preparedBy: quoteSettings.preparedBy,
+      preparedFor: quoteSettings.clientName,
+      companyLogoDataUrl: quoteSettings.companyLogoDataUrl || undefined,
+      brandColor: quoteSettings.brandColor || undefined,
+      printFooter: quoteSettings.printFooter || undefined,
+      // Permit-specific fields are blank by default — the integrator fills
+      // them in by hand after print, or we read them from a future
+      // PermitSettings dialog. For v1, blank is fine; the sheet still
+      // generates with placeholder dashes.
+    });
+    toast.success("Permit package exported");
+  }
+
+  async function exportPhotoTour() {
+    if (!design || !floor) return;
+    const photoCount = floor.devices.reduce(
+      (sum, d) => sum + (d.photos?.length ?? 0),
+      0,
+    );
+    if (photoCount === 0) {
+      toast.message("No site-walk photos yet", {
+        description:
+          "Select a device, click Add in the Photos section, then re-run this export.",
+      });
+      // Still generate the cover + empty-state page so the user has a
+      // sharable artefact to put in front of the team.
+    } else {
+      toast.info(
+        `Generating photo tour… ${photoCount} photo${photoCount === 1 ? "" : "s"}`,
+      );
+    }
+    const { exportPhotoTourPDF } = await import("@/lib/export");
+    await exportPhotoTourPDF(design, floor);
+    if (photoCount > 0) toast.success("Photo tour exported");
+  }
 
   return (
     <div className="relative">
@@ -261,6 +346,15 @@ function ProjectMenu({
                 }}
               />
               <MenuItem
+                icon={<ShieldCheck className="size-3.5 text-orange-500" />}
+                label="Permit package (PDF)"
+                description="10 sheets — AHJ submittal-ready"
+                onClick={() => {
+                  setOpen(false);
+                  exportPermitPackage();
+                }}
+              />
+              <MenuItem
                 icon={<FileSpreadsheet className="size-3.5 text-emerald-500" />}
                 label="Bill of materials (CSV)"
                 description="Quantities, pricing, labor"
@@ -276,6 +370,27 @@ function ProjectMenu({
                 onClick={() => {
                   setOpen(false);
                   exportSchedule();
+                }}
+              />
+              <MenuItem
+                icon={<Images className="size-3.5 text-violet-500" />}
+                label="Photo tour (PDF)"
+                description="Every site-walk photo, one per page"
+                onClick={() => {
+                  setOpen(false);
+                  exportPhotoTour();
+                }}
+              />
+            </MenuSection>
+            <div className="my-1 border-t border-border/50" />
+            <MenuSection label="Help">
+              <MenuItem
+                icon={<Compass className="size-3.5 text-primary" />}
+                label="Take the tour"
+                description="60-second walkthrough of the editor"
+                onClick={() => {
+                  setOpen(false);
+                  useDesignStore.getState().startTour();
                 }}
               />
             </MenuSection>

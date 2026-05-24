@@ -1,5 +1,16 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { NextRequest } from "next/server";
+import {
+  clippedFovPolygon,
+  pointToSegment,
+  polygonArea,
+  rayHitSegment,
+} from "@/lib/geometry";
+import { SYSTEM_PROMPT } from "@/lib/ai-prompt";
+import {
+  runAdvisorAgent,
+  type AdvisorRequestBody,
+} from "@/lib/ai-advisor-runner";
 
 /**
  * AI Chat endpoint — "Cursor for floor plans", agentic edition.
@@ -12,6 +23,8 @@ import type { NextRequest } from "next/server";
  *   event: operation        → { ...op }     a parsed tool call ready to apply
  *   event: web_search       → { query }     Claude is searching the web
  *   event: web_search_done  → { count }     a web search completed
+ *   event: tool_start       → { name, label }  a server-executed tool started
+ *   event: tool_end         → { name }      a server-executed tool finished
  *   event: citation         → { url, title, cited_text }
  *   event: turn             → { index }     a new turn of the agent loop started
  *   event: done             → { usage }     loop finished cleanly
@@ -23,7 +36,24 @@ import type { NextRequest } from "next/server";
  */
 
 const MODEL = "claude-sonnet-4-5";
-const MAX_TURNS = 12;
+/** Raised from 12 → 25 so the agent can run real verify-and-iterate
+ *  workflows (place → analyze_coverage → fix → re-analyze, or
+ *  unknown-product synthesis with multiple fetches). */
+const MAX_TURNS = 25;
+
+/** Tool names the SERVER executes — they return data to the agent rather
+ *  than mutating the client store. Everything else is parsed into a
+ *  ChatOperation and forwarded to the client as an "operation" event. */
+const SERVER_TOOL_NAMES = new Set<string>([
+  "analyze_coverage",
+  "run_advisor",
+  "fetch_url",
+  "validate_placement",
+]);
+
+/** Per-conversation cost guards on the spendier server tools. */
+const RUN_ADVISOR_MAX = 3;
+const FETCH_URL_MAX = 8;
 
 interface FloorSnapshot {
   name: string;
@@ -51,7 +81,27 @@ interface FloorSnapshot {
     mountHeightM: number;
     installStatus: "proposed" | "installed" | "decommissioned";
   }[];
-  doors: { id: string; x: number; y: number; widthMeters: number; locked: boolean; label: string }[];
+  doors: {
+    id: string;
+    x: number;
+    y: number;
+    widthMeters: number;
+    locked: boolean;
+    label: string;
+    /** Optional lock-hardware spec on this door. Surfaced to the agent
+     *  so it can reason about compatibility, voltage, fail mode, etc. */
+    lock?: {
+      type: string;
+      brand: string;
+      model: string;
+      voltage?: 12 | 24;
+      currentDrawA?: number;
+      failMode?: "fail-safe" | "fail-secure";
+      weatherRated?: boolean;
+      compatibleWith?: string[];
+      notes?: string;
+    };
+  }[];
   annotations: {
     id: string;
     x: number;
@@ -72,7 +122,9 @@ interface FloorSnapshot {
       unitCost: number;
       category: string;
     }[];
-    /** Live bill of materials — model, vendor, qty, unit price + subtotal */
+    /** Live bill of materials — model, vendor, qty, unit price + subtotal,
+     *  plus ecosystem/compatibility tags so the agent can flag mixed-vendor
+     *  combos without guessing. */
     bom: {
       modelId: string;
       displayName: string;
@@ -80,6 +132,8 @@ interface FloorSnapshot {
       quantity: number;
       unitPrice: number;
       subtotal: number;
+      ecosystem?: string;
+      compatibility?: string[];
     }[];
     hardwareSubtotal: number;
     laborSubtotal: number;
@@ -87,9 +141,22 @@ interface FloorSnapshot {
   };
 }
 
+/** Wire shape for a chat turn. Plain text for ordinary messages; multimodal
+ *  content blocks (text + image) for user turns that attached an image. */
+type WireContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: {
+        type: "base64";
+        media_type: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+        data: string;
+      };
+    };
+
 interface ChatMessage {
   role: "user" | "assistant";
-  content: string;
+  content: string | WireContentBlock[];
 }
 
 interface ChatRequestBody {
@@ -102,6 +169,10 @@ interface ChatRequestBody {
 export type ChatOperation =
   | {
       kind: "add-device";
+      /** Server-generated id — when present, the client uses this id so
+          server and client agree on which device the next op refers to
+          (lets analyze_coverage / validate_placement see in-turn edits). */
+      id?: string;
       deviceType: "camera" | "reader" | "sensor" | "network";
       subtype?: string;
       x: number;
@@ -130,10 +201,18 @@ export type ChatOperation =
       notes?: string;
       installStatus?: "proposed" | "installed" | "decommissioned";
     }
-  | { kind: "add-wall"; startX: number; startY: number; endX: number; endY: number }
+  | {
+      kind: "add-wall";
+      id?: string;
+      startX: number;
+      startY: number;
+      endX: number;
+      endY: number;
+    }
   | { kind: "remove-wall"; wallId: string }
   | {
       kind: "add-door";
+      id?: string;
       x: number;
       y: number;
       rotationDegrees: number;
@@ -143,6 +222,24 @@ export type ChatOperation =
       label: string;
     }
   | { kind: "set-floor-scale"; scalePxPerMeter: number }
+  | {
+      kind: "add-cable";
+      sourceDeviceId: string;
+      targetDeviceId: string;
+      cableType:
+        | "cat6"
+        | "cat6a"
+        | "fiber"
+        | "22-4"
+        | "18-2"
+        | "16-2"
+        | "rg59"
+        | "speaker-16-2";
+      waypoints?: { x: number; y: number }[];
+      label?: string;
+      notes?: string;
+    }
+  | { kind: "remove-cable"; cableId: string }
   | {
       kind: "add-annotation";
       x: number;
@@ -186,6 +283,29 @@ export type ChatOperation =
       kind: "set-view-mode";
       viewMode: "2d" | "3d" | "sim";
       threeDMode?: "orbit" | "walk";
+    }
+  | {
+      /** Set or clear the lock-hardware spec on a door. Pass `clear: true`
+       *  to wipe the spec; otherwise partial fields are merged. */
+      kind: "set-door-lock";
+      doorId: string;
+      clear?: boolean;
+      lockType?:
+        | "mag-lock"
+        | "electric-strike"
+        | "electric-bolt"
+        | "magnetic-shear"
+        | "smart-deadbolt"
+        | "smart-mortise"
+        | "exit-device";
+      brand?: string;
+      model?: string;
+      voltage?: 12 | 24;
+      currentDrawA?: number;
+      failMode?: "fail-safe" | "fail-secure";
+      weatherRated?: boolean;
+      compatibleWith?: string[];
+      notes?: string;
     };
 
 const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
@@ -331,6 +451,65 @@ const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
+    name: "add_cable",
+    description:
+      "Draw a cable between two devices. Use this to wire up: every camera or AP to an NVR or PoE switch (Cat6); every reader to a controller or panel (22/4); every door-hardware piece (electric strike, mag lock, exit device, intercom) to its power supply or access controller (18/2 default). Optional intermediate waypoints in floor-plan pixel coords let you route around obstacles. Pick the cable type that matches integrator convention.",
+    input_schema: {
+      type: "object",
+      properties: {
+        sourceDeviceId: {
+          type: "string",
+          description: "Device id the cable starts at (the drop / leaf device).",
+        },
+        targetDeviceId: {
+          type: "string",
+          description:
+            "Device id the cable terminates at (NVR, switch, controller, power supply).",
+        },
+        cableType: {
+          type: "string",
+          enum: [
+            "cat6",
+            "cat6a",
+            "fiber",
+            "22-4",
+            "18-2",
+            "16-2",
+            "rg59",
+            "speaker-16-2",
+          ],
+          description:
+            "Cable spec. Rule of thumb: cameras + APs → cat6, readers → 22-4, door hardware/PSU → 18-2. Use cat6a for 10G runs, fiber for >100m, rg59 only for legacy analog video.",
+        },
+        waypoints: {
+          type: "array",
+          description:
+            "Optional list of intermediate bend points in floor-plan pixel coords. Use to route the cable around walls, columns, or HVAC.",
+          items: {
+            type: "object",
+            properties: {
+              x: { type: "number" },
+              y: { type: "number" },
+            },
+            required: ["x", "y"],
+          },
+        },
+        label: { type: "string" },
+        notes: { type: "string" },
+      },
+      required: ["sourceDeviceId", "targetDeviceId", "cableType"],
+    },
+  },
+  {
+    name: "remove_cable",
+    description: "Delete a cable by id.",
+    input_schema: {
+      type: "object",
+      properties: { cableId: { type: "string" } },
+      required: ["cableId"],
+    },
+  },
+  {
     name: "add_annotation",
     description:
       "Pin a sticky-note style annotation on the floor plan at (x, y). Use this to flag concerns, suggest improvements without acting, leave reminders, or call out compliance issues. Annotations appear on the canvas as floating markers.",
@@ -436,6 +615,118 @@ const DOMAIN_TOOLS: Anthropic.Messages.Tool[] = [
       },
     },
   },
+  // ──────────────────────────────────────────────────────────────────────
+  // SERVER-EXECUTED TOOLS — return data to the agent, don't mutate client.
+  // ──────────────────────────────────────────────────────────────────────
+  {
+    name: "analyze_coverage",
+    description:
+      "Compute the WALL-CLIPPED FOV coverage for every camera (or a filtered subset). Returns each camera's actual reachable area vs nominal cone area, with a verdict (minimal / meaningful / HEAVY / MOSTLY BLOCKED). Use this BEFORE acting (to find the worst cameras) and to audit a design holistically. NOTE: reflects the floor at the start of THIS turn — it does NOT include devices you've added later in the same turn.",
+    input_schema: {
+      type: "object",
+      properties: {
+        deviceIds: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional. Restrict analysis to these camera ids. If omitted, analyze every camera on the floor.",
+        },
+      },
+    },
+  },
+  {
+    name: "run_advisor",
+    description:
+      "Run the full AI Coverage Advisor against the current floor. Returns a structured punch list of findings (blind spots, redundancies, missing sensors/network, compliance gaps) each with a recommended action. Use when the user asks to 'audit', 'review for gaps', or 'tell me what's wrong with this design'. EXPENSIVE: capped at 3 calls per conversation.",
+    input_schema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "fetch_url",
+    description:
+      "GET a publicly-reachable HTTPS URL and return the text content (HTML stripped, capped at ~50 KB). Use this when web_search results give you a promising link and you need the actual page text — e.g. a manufacturer spec sheet, a city permit fee table, a code requirements page. Capped at 8 calls per conversation. Private/local URLs are blocked.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Full HTTPS URL.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "set_door_lock",
+    description:
+      "Specify or update the lock hardware on an existing door. Use this when the user asks about door hardware ('what lock should the server door use?', 'spec a mag lock on the front entry'), when running a compatibility audit, or after recommending a lock type during a security review. The lock spec is DIFFERENT from the door's locked state — locked is whether the bolt is engaged right now; this is the actual hardware (HID mag lock, Schlage Encode, etc.). Pass `clear: true` to remove the spec entirely. Partial updates are merged with the existing spec.",
+    input_schema: {
+      type: "object",
+      properties: {
+        doorId: { type: "string", description: "Required — must match an existing door id." },
+        clear: {
+          type: "boolean",
+          description: "When true, removes the lock spec from this door. Other fields ignored.",
+        },
+        lockType: {
+          type: "string",
+          enum: [
+            "mag-lock",
+            "electric-strike",
+            "electric-bolt",
+            "magnetic-shear",
+            "smart-deadbolt",
+            "smart-mortise",
+            "exit-device",
+          ],
+          description:
+            "mag-lock = electromagnetic, fail-safe by physics. electric-strike retrofits existing locksets. smart-deadbolt = Schlage Encode / Yale Assure for residential or smart-only access. smart-mortise = Salto / dormakaba commercial.",
+        },
+        brand: { type: "string", description: "e.g. HID, Schlage, Salto, ASSA ABLOY, HES." },
+        model: { type: "string", description: "e.g. 'HES 9600', 'Schlage Encode', 'Salto XS4'." },
+        voltage: { type: "number", enum: [12, 24], description: "12 or 24 VDC." },
+        currentDrawA: { type: "number", description: "Current draw in amps (matters for power-supply sizing)." },
+        failMode: {
+          type: "string",
+          enum: ["fail-safe", "fail-secure"],
+          description:
+            "fail-safe unlocks on power loss (egress / life safety). fail-secure stays locked (storage, IT, server rooms).",
+        },
+        weatherRated: { type: "boolean", description: "True for exterior-rated hardware." },
+        compatibleWith: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Brands or product ids this lock natively integrates with. Used by the agent to flag mixed-vendor incompatibility.",
+        },
+        notes: { type: "string", description: "Anything else worth noting (power supply, panic hardware coupling, etc.)." },
+      },
+      required: ["doorId"],
+    },
+  },
+  {
+    name: "validate_placement",
+    description:
+      "Spatial sanity check on one or more devices. Returns per-device structural assessment: distance to nearest wall, whether a camera's FOV is pointed into a nearby wall, distance from a reader to the nearest door, redundancy between cameras, etc. THIS REFLECTS DEVICES YOU JUST PLACED IN THIS TURN — call it after add_device / move_device / rotate_device to verify your work and self-correct before answering. Use the most-specific filter you can (deviceId for one, deviceIds for a batch) so the output stays focused.",
+    input_schema: {
+      type: "object",
+      properties: {
+        deviceId: {
+          type: "string",
+          description:
+            "Validate a single device by id. Use this right after touching one device.",
+        },
+        deviceIds: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Validate a batch of devices. Use after placing several in one tool burst.",
+        },
+      },
+    },
+  },
 ];
 
 /**
@@ -450,237 +741,9 @@ const WEB_SEARCH_TOOL = {
   max_uses: 5,
 } as const;
 
-const SYSTEM_PROMPT = `You are the in-app AI editor for DeeperVision, a CAD tool for designing commercial security systems. You're embedded in a right-side chat panel — the user is sitting in front of their floor plan, looking at it on the same screen as your reply.
-
-You are an AGENTIC editor. Plan, act, and verify across multiple tool calls in a single turn. Don't ask permission for small changes — apply them and explain after.
-
-═══ TOOLS ═══
-
-DESIGN EDITS (apply to the floor immediately, client-side):
-  add_device              add a camera / reader / sensor / network device
-  move_device             relocate a device by id
-  rotate_device           change a device's rotation
-  remove_device           delete a device
-  update_device           change label / range / FOV / mount / status / notes
-  add_wall                draw a wall segment
-  remove_wall             delete a wall by id
-  add_door                add a door on a wall by id
-  set_floor_scale         recalibrate pixels-per-meter
-
-ANNOTATIONS (sticky notes pinned on the canvas — visible to user):
-  add_annotation          pin a "note" / "warning" / "idea" at (x, y) on the
-                          floor plan. Use this to call out concerns, flag
-                          compliance issues, or suggest improvements WITHOUT
-                          actually editing the design. Great for things you
-                          want the user to decide on.
-  remove_annotation       delete an annotation by id
-
-QUOTE (shape the project quote — bill of materials, rates, line items):
-  add_quote_line_item     add a custom line item (permits, lift rental, etc.)
-  remove_quote_line_item  remove a line item by index
-  update_quote_settings   change rates, client info, brand color, regional
-                          notes, narrative, etc.
-
-QUOTE AUDIT PATTERN: when the user asks you to "audit", "verify", "review",
-"double-check" or "make sure my pricing is accurate," DON'T just glance at
-the BoM in your context — actually call web_search on the priced models
-you're unsure about, cite real sources, and adjust unit prices via
-update_quote_settings (for global rates) or annotations (kind="warning")
-when you spot a stale price you don't want to silently overwrite.
-
-MULTI-VENDOR INTEGRATION AUDIT: the BoM in your context lists each
-device's vendor (Verkada, Avigilon, Axis, Hanwha, Bosch, etc.). When
-asked to review the design, look for integration concerns — e.g. mixing
-ONVIF-friendly camera brands with a closed-ecosystem NVR, or pairing
-Verkada cameras with an on-prem Axis recorder when both would normally
-need their own management plane. Flag these as add_annotation kind=
-"warning" with a one-sentence rationale. Don't refuse — recommend a
-compatible alternative or a bridging product (web_search if needed).
-
-UNKNOWN-PRODUCT FLOW: when the user names a specific product NOT in
-your catalog ("add a Lorex N863A3", "use the Hikvision DS-2CD2387G2"),
-DO NOT refuse. Build it on the fly:
-  1. web_search "<brand> <model> spec sheet price" to find the type
-     (dome/bullet/PTZ/fisheye/reader/sensor/NVR/switch/AP), FOV,
-     range, mount height, and current street price.
-  2. Call add_device with:
-       • type    — closest match (camera | reader | sensor | network)
-       • subtype — closest 3D mesh shape (dome | bullet | ptz | fisheye
-                   | multi-sensor | card | biometric | keypad | motion
-                   | glass-break | door-contact | smoke | nvr | switch
-                   | access-point)
-       • label   — "<Brand> <Model>"  ← shown on the canvas + quote
-       • model   — same "<Brand> <Model>" string  ← shows in BoM
-       • fovDegrees, rangeMeters, mountHeightM — pulled from your
-         research, or sensible defaults if unclear
-       • notes   — one-line summary + price URL
-  3. Add the device's price to the quote via add_quote_line_item
-     (category: "materials", quantity: <copies>, description:
-     "<Brand> <Model> hardware") so the user's BoM total tracks it.
-  4. Cite the spec/price source.
-The 3D representation reuses the subtype's built-in mesh (dome shape,
-bullet shape, etc.) — the label tells the user it's the specific
-product. This is what "synthesizing a replica" means in practice.
-
-VIEW (UI navigation — you control which view the user is looking at):
-  set_view_mode           switch the top-level view between '2d' (floor
-                          plan canvas — best for placing/moving devices,
-                          drawing walls), '3d' (extruded scene — best
-                          for showing coverage, room layout, camera
-                          angles), or 'sim' (path simulator).  When
-                          viewMode='3d' you can also set threeDMode to
-                          'orbit' (free-look, default) or 'walk' (WASD
-                          first-person walkthrough). Use this PROACTIVELY
-                          — e.g. switch to 3D before describing a
-                          coverage gap, switch to 2D before placing many
-                          devices, switch to walk to show the user what
-                          a corridor feels like at floor level.
-
-  view_from_camera        flip the 3D scene into first-person POV from a
-                          specific camera (auto-switches to 3D if you're
-                          in 2D). Use when the user asks "what does X
-                          see" / "show me X's view" / "POV that camera".
-                          Always also explain in text what they should
-                          look for.
-
-The current view + 3D submode are reported in the floor state. Both 2D
-and 3D render the same data — your edits show up in both. Annotations
-appear in 2D as sticky-note pills on the canvas and in 3D as floating
-billboards above their pin point, so commentary is visible regardless
-of which view the user is in.
-
-RESEARCH (server-side; results stream back as citations):
-  web_search              search the web — use this when the user asks for
-                          specific product pricing, current code requirements,
-                          regional regulations, manufacturer specs, or
-                          anything you don't know with confidence. ALSO use
-                          it before adding quote line items so prices are
-                          backed by real sources. Always cite.
-
-═══ COORDINATES ═══
-
-Floor-plan pixels, top-left origin, X right, Y down. The scale is given as
-pixels-per-meter in the floor state. Convert when the user talks in meters
-or feet ("1 m off the wall" → scalePxPerMeter pixels).
-
-═══ AGENTIC BEHAVIOR ═══
-
-When the user asks a complex request, run a multi-step plan:
-  1. If product/pricing/code info is needed → call web_search FIRST.
-  2. Apply concrete edits via the domain tools.
-  3. End with a short text summary referencing any citations.
-
-Multiple tool calls per turn are encouraged. Example:
-  user: "Find the cheapest 4K dome camera under $300 and place one at each
-        corner of the conference room."
-  → web_search("cheap 4K dome IP camera under \\$300 2024")
-  → 4× add_device with the model from the top result
-  → text: "Placed 4× <Model> ($XXX each from <vendor>) at the corners."
-
-═══ STYLE ═══
-
-• Be concise — 1–4 sentences typically.
-• Don't restate what you're about to do; just do it. Operation chips show
-  applied edits in the UI.
-• Cite sources whenever you used web_search.
-• Prefer realistic placements: cameras at wall corners ~2.8 m, readers near
-  doors ~1.2 m, motion sensors ceiling-mounted in room centers.
-• For "add cameras to cover X", aim for ~80% coverage. A small room needs
-  1–2 cameras; long corridors need one per ~12 m.
-• Use existing device ids (dev_xxx) and wall ids (wall_xxx) when modifying —
-  never invent ids.
-
-═══ SUGGEST vs ACT ═══
-
-When the user asks "where should I put X?", "what would you do?", "any
-ideas?", or any other open-ended/advisory question, DO NOT auto-place
-devices. Instead, drop add_annotation markers with kind="idea" at each
-proposed location — one note per spot, with a one-sentence rationale.
-The user can then click a marker to act on it, or ask you to "apply"
-your suggestions.
-
-When the user gives a DIRECTIVE ("add a camera at the front door",
-"cover the corridor with motion sensors"), just do it — annotations
-would be friction.
-
-PROACTIVE DOORS: when looking at a floor that has walls but no doors,
-or when the user explicitly asks you to add doors, use add_door at
-plausible openings (gap in a long wall, or the obvious entry side of
-a room). Doors render as wood-textured slabs in the 3D view and gate
-the simulator's walkthrough. Aim for 1 door per room — front entries
-unlocked, server/IT/storage rooms locked.
-
-═══ SPATIAL REASONING — READ BEFORE PLACING DOORS OR DEVICES ═══
-
-The walls list classifies every wall as HORIZONTAL/VERTICAL/DIAGONAL
-and as EXTERIOR (NORTH/SOUTH/EAST/WEST) or INTERIOR. Use this
-vocabulary instead of guessing.
-
-DOOR PLACEMENT — practical rules
-  1. INTERIOR doors go on INTERIOR walls. Don't put an interior
-     door on an EXTERIOR wall — that would be the building
-     entrance. Use that role exactly once, on the wall the user
-     calls out as the front entry.
-  2. A wall typically gets at MOST ONE door. If you already put a
-     door on a wall, pick a different wall for the next room.
-  3. Start from the wall's published mid (mx, my) coordinates. The
-     server snaps the door onto the wall segment anyway, but
-     supplying the midpoint reads as "centered" in 3D.
-  4. Lock doors on rooms that contain sensitive gear (server, IT,
-     records, mechanical). Leave general-use doors unlocked.
-  5. When a room has only one interior wall facing the corridor,
-     that's the door wall — even if other walls are longer.
-
-CAMERA PLACEMENT — practical rules
-  • Mount in corners angled INTO the room (rotation = ~45° offset
-    from the corner). One corner camera per ~6 m of room dimension
-    on the long axis, mounted at 2.6–2.8 m.
-  • Cover every entry/exit with one camera that can see faces.
-  • Hallways: PTZ or bullet at one end, watching the run length.
-  • Don't double-cover the same square footage from cameras owned
-    by overlapping FOVs — flag redundancy as a warning annotation.
-
-READER PLACEMENT — practical rules
-  • Pair every controlled door with a reader on the OUTSIDE
-    (approach) side, ~1 m to the latch side of the door, mounted
-    at 1.2 m.
-  • Server / IT / electrical room doors should always have a
-    reader. Front entries usually have one too.
-
-SENSOR PLACEMENT — practical rules
-  • Motion sensors are ceiling-mounted near the ROOM CENTER.
-  • Glass-break sensors go within 3 m of a window on the inside
-    wall.
-  • Door-contact sensors sit on the door itself — coordinate the
-    door's position via add_door first, then drop the sensor at the
-    same (x, y).
-
-NETWORK GEAR — practical rules
-  • NVR + main switch live together in the server / IT room.
-  • Access points distribute across the floor at ~12 m spacing,
-    centered in their coverage area.
-
-Use the floor-extents centroid + per-wall metadata to make these
-calls. If unsure between two walls, pick the longer INTERIOR wall —
-it'll usually be the correct one.
-
-Warnings work similarly: if you notice a real issue while doing other
-work, drop add_annotation kind="warning" rather than burying it in text.
-
-═══ MEMORY ═══
-
-Earlier turns in this conversation may have been trimmed for token
-efficiency. If you see a "[Conversation recap — N earlier message(s)
-trimmed]" block in the user message, that's the summary of what already
-happened. Trust the floor state as ground truth; use the recap for
-context on intent and tone.
-
-═══ SAFETY ═══
-
-• Don't bulk-delete devices without an obvious user instruction.
-• Don't change the floor scale without good reason (web evidence or explicit
-  request).
-• Refuse politely if the user asks something the tools can't do.`;
+/* SYSTEM_PROMPT is composed from per-section modules under lib/ai-prompt/
+   so each piece (tools, spatial rules, coverage, etc.) can be iterated on
+   without scrolling a 270-line string. See lib/ai-prompt/index.ts. */
 
 export async function POST(request: NextRequest) {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -721,20 +784,88 @@ export async function POST(request: NextRequest) {
 
         // Inject the floor snapshot into the LAST user message so Claude
         // always sees the freshest state — even on multi-turn convos where
-        // prior turns mutated the floor.
+        // prior turns mutated the floor. When that message is multimodal
+        // (image + text), prepend the floor context to the text block so the
+        // image stays intact.
         const claudeMessages: Anthropic.Messages.MessageParam[] = body.messages.map(
           (m, i, arr) => {
             const isLastUser = m.role === "user" && i === arr.length - 1;
-            const content = isLastUser
-              ? `${floorContext}\n\nUser: ${m.content}`
-              : m.content;
-            return { role: m.role, content };
+            if (!isLastUser) {
+              return {
+                role: m.role,
+                content: m.content as Anthropic.Messages.MessageParam["content"],
+              };
+            }
+            if (typeof m.content === "string") {
+              return {
+                role: m.role,
+                content: `${floorContext}\n\nUser: ${m.content}`,
+              };
+            }
+            const blocks = m.content.map((b) =>
+              b.type === "text"
+                ? { type: "text" as const, text: `${floorContext}\n\nUser: ${b.text}` }
+                : b,
+            );
+            // If the user attached an image but typed nothing, there's no
+            // text block to splice into — prepend a fresh one carrying the
+            // floor context plus a tiny stand-in user line.
+            const hasText = blocks.some((b) => b.type === "text");
+            const finalBlocks = hasText
+              ? blocks
+              : [
+                  { type: "text" as const, text: `${floorContext}\n\nUser: (image attached)` },
+                  ...blocks,
+                ];
+            return {
+              role: m.role,
+              content: finalBlocks as Anthropic.Messages.MessageParam["content"],
+            };
           },
         );
 
         let totalIn = 0;
         let totalOut = 0;
+        let totalCacheCreate = 0;
+        let totalCacheRead = 0;
         let webSearchCount = 0;
+        // Per-conversation guards so the agent can't run away with cost on
+        // the spendy server tools. Soft caps — the tool returns an error
+        // result when the limit is reached and Claude moves on.
+        const budgets: ServerToolBudgets = {
+          runAdvisorUsed: 0,
+          fetchUrlUsed: 0,
+        };
+        // Mutable mirror of the floor state. Updates as the agent issues
+        // add / move / rotate / remove ops within this turn so the server
+        // tools (analyze_coverage, validate_placement) see the agent's
+        // in-progress edits — not the snapshot frozen at request time.
+        // Client + server agree on entity ids because the server generates
+        // them here and ships them inside the operation event.
+        const serverFloor: FloorSnapshot = cloneFloorForMirror(body.floor);
+        let srvIdCounter = 0;
+        const nextServerId = (prefix: string) =>
+          `${prefix}_srv_${Date.now().toString(36)}_${++srvIdCounter}`;
+
+        // Cache the system prompt + tools array. Both are stable across
+        // turns and across conversations, so the prompt cache slashes input
+        // tokens on every follow-up turn within the 5-minute TTL.
+        const cachedSystem: Anthropic.Messages.TextBlockParam[] = [
+          {
+            type: "text",
+            text: SYSTEM_PROMPT,
+            cache_control: { type: "ephemeral" },
+          },
+        ];
+        const cachedTools = [
+          ...DOMAIN_TOOLS.slice(0, -1),
+          {
+            ...DOMAIN_TOOLS[DOMAIN_TOOLS.length - 1],
+            cache_control: { type: "ephemeral" as const },
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          WEB_SEARCH_TOOL as any,
+        ];
 
         for (let turn = 0; turn < MAX_TURNS; turn++) {
           send("turn", { index: turn });
@@ -745,12 +876,8 @@ export async function POST(request: NextRequest) {
           const apiStream = client.messages.stream({
             model: MODEL,
             max_tokens: 4096,
-            system: SYSTEM_PROMPT,
-            tools: [
-              ...DOMAIN_TOOLS,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              WEB_SEARCH_TOOL as any,
-            ],
+            system: cachedSystem,
+            tools: cachedTools,
             messages: claudeMessages,
           });
 
@@ -822,12 +949,39 @@ export async function POST(request: NextRequest) {
                   /* swallow malformed JSON */
                 }
               } else if (b.type === "tool_use" && b.name) {
-                try {
-                  const input = JSON.parse(b.json) as Record<string, unknown>;
-                  const op = toolUseToOperation(b.name, input);
-                  if (op) send("operation", op);
-                } catch {
-                  /* swallow malformed tool JSON */
+                if (SERVER_TOOL_NAMES.has(b.name)) {
+                  // Server-executed tool — emit a progress pill now so the
+                  // UI shows activity. Actual execution happens after the
+                  // stream ends (we have the input ready, but Claude is
+                  // expecting tool_result on the NEXT API call).
+                  send("tool_start", {
+                    name: b.name,
+                    label: serverToolLabel(b.name, b.json),
+                  });
+                } else {
+                  try {
+                    const input = JSON.parse(b.json) as Record<string, unknown>;
+                    const op = toolUseToOperation(b.name, input);
+                    if (op) {
+                      // Mirror the op on the server-side floor (used by
+                      // analyze_coverage / validate_placement). For ops
+                      // that create new entities, the mirror returns a
+                      // synthetic id that gets stamped onto the operation
+                      // so the client uses the SAME id — keeping client
+                      // and server in agreement for subsequent ops.
+                      const { idAssigned } = mirrorOpToServerFloor(
+                        op,
+                        serverFloor,
+                        nextServerId,
+                      );
+                      if (idAssigned) {
+                        (op as { id?: string }).id = idAssigned;
+                      }
+                      send("operation", op);
+                    }
+                  } catch {
+                    /* swallow malformed tool JSON */
+                  }
                 }
               }
               blocks.delete(event.index);
@@ -837,35 +991,75 @@ export async function POST(request: NextRequest) {
           const finalMessage = await apiStream.finalMessage();
           totalIn += finalMessage.usage.input_tokens;
           totalOut += finalMessage.usage.output_tokens;
+          totalCacheCreate += finalMessage.usage.cache_creation_input_tokens ?? 0;
+          totalCacheRead += finalMessage.usage.cache_read_input_tokens ?? 0;
 
           if (finalMessage.stop_reason !== "tool_use") break;
 
-          // Build tool_results for client-side tools so Claude can continue.
-          // Server-side tools (web_search) already have their results inline
-          // in finalMessage.content — we skip them here.
-          const clientToolUses = finalMessage.content.filter(
-            (
-              c,
-            ): c is Anthropic.Messages.ToolUseBlock =>
-              c.type === "tool_use",
+          // Build tool_results for every tool_use block. Two paths:
+          //   1. Server-executed tools (analyze_coverage / run_advisor /
+          //      fetch_url) run here and return a real string result.
+          //   2. Client tools acknowledge with "ok" — the actual mutation
+          //      happens on the client via the "operation" SSE events we
+          //      already streamed.
+          // The native web_search server tool already has its results
+          // inline in finalMessage.content (handled by the SDK); we just
+          // skip tool_use blocks of that type.
+          const allToolUses = finalMessage.content.filter(
+            (c): c is Anthropic.Messages.ToolUseBlock => c.type === "tool_use",
           );
-          if (clientToolUses.length === 0) break;
+          if (allToolUses.length === 0) break;
 
-          claudeMessages.push(
-            { role: "assistant", content: finalMessage.content },
-            {
-              role: "user",
-              content: clientToolUses.map((t) => ({
+          const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
+          for (const t of allToolUses) {
+            if (SERVER_TOOL_NAMES.has(t.name)) {
+              let resultText: string;
+              try {
+                resultText = await executeServerTool({
+                  name: t.name,
+                  input: t.input as Record<string, unknown>,
+                  // The LIVE server-side floor mirror — reflects every
+                  // add/move/rotate/remove the agent issued earlier in
+                  // this turn, not the snapshot frozen at request time.
+                  floor: serverFloor,
+                  designName: body.designName,
+                  buildingType: body.buildingType,
+                  client,
+                  budgets,
+                });
+              } catch (err) {
+                resultText = `Tool error: ${
+                  err instanceof Error ? err.message : String(err)
+                }`;
+              }
+              send("tool_end", { name: t.name });
+              toolResults.push({
+                type: "tool_result" as const,
+                tool_use_id: t.id,
+                content: resultText,
+              });
+            } else {
+              toolResults.push({
                 type: "tool_result" as const,
                 tool_use_id: t.id,
                 content: "ok",
-              })),
-            },
+              });
+            }
+          }
+
+          claudeMessages.push(
+            { role: "assistant", content: finalMessage.content },
+            { role: "user", content: toolResults },
           );
         }
 
         send("done", {
-          usage: { inputTokens: totalIn, outputTokens: totalOut },
+          usage: {
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            cacheCreationTokens: totalCacheCreate,
+            cacheReadTokens: totalCacheRead,
+          },
           webSearches: webSearchCount,
         });
       } catch (err) {
@@ -956,8 +1150,24 @@ function formatFloorContext(body: ChatRequestBody): string {
   if (floor.doors.length === 0) lines.push("  (none)");
   else {
     for (const d of floor.doors) {
+      const bits: string[] = [
+        `${d.widthMeters} m wide`,
+        d.locked ? "locked" : "unlocked",
+      ];
+      if (d.lock) {
+        const lockBits = [`${d.lock.type}`];
+        if (d.lock.brand || d.lock.model) {
+          lockBits.push(`${d.lock.brand} ${d.lock.model}`.trim());
+        }
+        if (d.lock.voltage) lockBits.push(`${d.lock.voltage}VDC`);
+        if (d.lock.failMode) lockBits.push(d.lock.failMode);
+        if (d.lock.weatherRated) lockBits.push("weather-rated");
+        bits.push(`lock: ${lockBits.join(" · ")}`);
+      } else {
+        bits.push("no lock spec");
+      }
       lines.push(
-        `  [${d.id}] "${d.label}" @ (${d.x.toFixed(0)},${d.y.toFixed(0)}) — ${d.widthMeters} m wide, ${d.locked ? "locked" : "unlocked"}`,
+        `  [${d.id}] "${d.label}" @ (${d.x.toFixed(0)},${d.y.toFixed(0)}) — ${bits.join(", ")}`,
       );
     }
   }
@@ -975,6 +1185,55 @@ function formatFloorContext(body: ChatRequestBody): string {
       );
     }
   }
+  // 3D-AWARE COVERAGE ANALYSIS — for each camera, compute the wall-clipped
+  // FOV polygon area and compare against the nominal (un-occluded) cone
+  // area. This is the agent's signal that a camera is "wasting" its FOV
+  // behind a wall, regardless of what the 2D plan looks like at a glance.
+  const cameras = floor.devices.filter(
+    (d) =>
+      d.type === "camera" &&
+      typeof d.fovDegrees === "number" &&
+      typeof d.rangeMeters === "number",
+  );
+  if (cameras.length > 0 && floor.walls.length > 0) {
+    const wallSegs = floor.walls.map((w) => ({
+      start: { x: w.startX, y: w.startY },
+      end: { x: w.endX, y: w.endY },
+    }));
+    lines.push("");
+    lines.push("Camera coverage (wall-clipped, 3D-aware):");
+    for (const cam of cameras) {
+      const fov = cam.fovDegrees!;
+      const rangeM = cam.rangeMeters!;
+      const rotRad = (cam.rotationDegrees * Math.PI) / 180;
+      const polygon = clippedFovPolygon({
+        origin: { x: cam.x, y: cam.y },
+        rotation: rotRad,
+        fovDegrees: fov,
+        rangeMeters: rangeM,
+        scalePxPerMeter: floor.scalePxPerMeter,
+        walls: wallSegs,
+        segments: 24,
+      });
+      const actualSqPx = polygonArea(polygon);
+      const actualSqM = actualSqPx / (floor.scalePxPerMeter * floor.scalePxPerMeter);
+      const nominalSqM = Math.PI * rangeM * rangeM * (fov / 360);
+      const pct = nominalSqM > 0 ? Math.round((actualSqM / nominalSqM) * 100) : 0;
+      const blocked = Math.max(0, nominalSqM - actualSqM);
+      const verdict =
+        pct >= 90
+          ? "minimal occlusion"
+          : pct >= 65
+            ? `${blocked.toFixed(1)} m² blocked by walls`
+            : pct >= 40
+              ? `HEAVY OCCLUSION — ${blocked.toFixed(1)} m² blocked; consider rotating or moving`
+              : `MOSTLY BLOCKED — only ${pct}% of FOV reaches anything`;
+      lines.push(
+        `  [${cam.id}] "${cam.label}" — nominal ${nominalSqM.toFixed(1)} m², actual ${actualSqM.toFixed(1)} m² (${pct}%) — ${verdict}`,
+      );
+    }
+  }
+
   if (floor.annotations && floor.annotations.length > 0) {
     lines.push("");
     lines.push(`Annotations (${floor.annotations.length}):`);
@@ -999,8 +1258,13 @@ function formatFloorContext(body: ChatRequestBody): string {
     if (floor.quote.bom.length > 0) {
       lines.push(`  Bill of materials (${floor.quote.bom.length} line(s)):`);
       floor.quote.bom.forEach((row) => {
+        const eco = row.ecosystem ? ` [${row.ecosystem}]` : "";
+        const compat =
+          row.compatibility && row.compatibility.length > 0
+            ? ` works-with: ${row.compatibility.join(",")}`
+            : "";
         lines.push(
-          `    ${row.vendor} ${row.displayName} × ${row.quantity} @ $${row.unitPrice} = $${row.subtotal}`,
+          `    ${row.vendor} ${row.displayName} × ${row.quantity} @ $${row.unitPrice} = $${row.subtotal}${eco}${compat}`,
         );
       });
     } else {
@@ -1210,6 +1474,53 @@ function toolUseToOperation(
       if (!Number.isFinite(ppm) || ppm < 5 || ppm > 600) return null;
       return { kind: "set-floor-scale", scalePxPerMeter: ppm };
     }
+    case "add_cable": {
+      const ALLOWED_TYPES = [
+        "cat6",
+        "cat6a",
+        "fiber",
+        "22-4",
+        "18-2",
+        "16-2",
+        "rg59",
+        "speaker-16-2",
+      ] as const;
+      const sourceDeviceId =
+        typeof input.sourceDeviceId === "string"
+          ? input.sourceDeviceId.trim()
+          : "";
+      const targetDeviceId =
+        typeof input.targetDeviceId === "string"
+          ? input.targetDeviceId.trim()
+          : "";
+      const cableType = input.cableType as (typeof ALLOWED_TYPES)[number];
+      if (!sourceDeviceId || !targetDeviceId) return null;
+      if (sourceDeviceId === targetDeviceId) return null;
+      if (!ALLOWED_TYPES.includes(cableType)) return null;
+      const rawWaypoints = Array.isArray(input.waypoints) ? input.waypoints : [];
+      const waypoints = rawWaypoints
+        .map((w) => {
+          const obj = w as { x?: unknown; y?: unknown };
+          return { x: Number(obj.x), y: Number(obj.y) };
+        })
+        .filter((w) => Number.isFinite(w.x) && Number.isFinite(w.y))
+        .slice(0, 12);
+      return {
+        kind: "add-cable",
+        sourceDeviceId,
+        targetDeviceId,
+        cableType,
+        waypoints: waypoints.length > 0 ? waypoints : undefined,
+        label: typeof input.label === "string" ? input.label : undefined,
+        notes: typeof input.notes === "string" ? input.notes : undefined,
+      };
+    }
+    case "remove_cable": {
+      const cableId =
+        typeof input.cableId === "string" ? input.cableId.trim() : "";
+      if (!cableId) return null;
+      return { kind: "remove-cable", cableId };
+    }
     case "add_annotation": {
       const kind = input.annotationKind as "note" | "warning" | "idea";
       if (!["note", "warning", "idea"].includes(kind)) return null;
@@ -1280,6 +1591,54 @@ function toolUseToOperation(
           : undefined;
       return { kind: "set-view-mode", viewMode, threeDMode };
     }
+    case "set_door_lock": {
+      const doorId = typeof input.doorId === "string" ? input.doorId.trim() : "";
+      if (!doorId) return null;
+      if (input.clear === true) {
+        return { kind: "set-door-lock", doorId, clear: true };
+      }
+      const op: ChatOperation = { kind: "set-door-lock", doorId };
+      const validLockTypes = new Set([
+        "mag-lock",
+        "electric-strike",
+        "electric-bolt",
+        "magnetic-shear",
+        "smart-deadbolt",
+        "smart-mortise",
+        "exit-device",
+      ]);
+      if (
+        typeof input.lockType === "string" &&
+        validLockTypes.has(input.lockType)
+      ) {
+        op.lockType = input.lockType as Extract<
+          ChatOperation,
+          { kind: "set-door-lock" }
+        >["lockType"];
+      }
+      if (typeof input.brand === "string") op.brand = input.brand;
+      if (typeof input.model === "string") op.model = input.model;
+      if (input.voltage === 12 || input.voltage === 24) op.voltage = input.voltage;
+      if (typeof input.currentDrawA === "number" && input.currentDrawA > 0) {
+        op.currentDrawA = input.currentDrawA;
+      }
+      if (
+        input.failMode === "fail-safe" ||
+        input.failMode === "fail-secure"
+      ) {
+        op.failMode = input.failMode;
+      }
+      if (typeof input.weatherRated === "boolean") {
+        op.weatherRated = input.weatherRated;
+      }
+      if (Array.isArray(input.compatibleWith)) {
+        op.compatibleWith = input.compatibleWith.filter(
+          (x): x is string => typeof x === "string",
+        );
+      }
+      if (typeof input.notes === "string") op.notes = input.notes;
+      return op;
+    }
     case "update_quote_settings": {
       const op: ChatOperation = { kind: "update-quote-settings" };
       const numericFields = [
@@ -1336,4 +1695,657 @@ function extractAnthropicError(err: unknown): {
     message: err instanceof Error ? err.message : "Unknown error.",
     status: 502,
   };
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   SERVER-SIDE FLOOR MIRROR
+   ─────────────────────────────────────────────────────────────────────── */
+
+/** Shallow-clones the floor with FRESH array copies so the mirror can be
+ *  mutated freely without leaking changes back to the request body. */
+function cloneFloorForMirror(src: FloorSnapshot): FloorSnapshot {
+  return {
+    ...src,
+    walls: src.walls.map((w) => ({ ...w })),
+    devices: src.devices.map((d) => ({ ...d })),
+    doors: src.doors.map((d) => ({ ...d })),
+    annotations: src.annotations.map((a) => ({ ...a })),
+  };
+}
+
+/** Apply a chat operation to the server-side floor mirror. Returns the
+ *  newly-assigned id for create-style ops so the caller can stamp it onto
+ *  the outgoing operation event (keeping client + server ids in sync). */
+function mirrorOpToServerFloor(
+  op: ChatOperation,
+  floor: FloorSnapshot,
+  nextId: (prefix: string) => string,
+): { idAssigned?: string } {
+  switch (op.kind) {
+    case "add-device": {
+      const id = nextId("dev");
+      floor.devices.push({
+        id,
+        type: op.deviceType,
+        subtype: op.subtype,
+        label: op.label,
+        x: op.x,
+        y: op.y,
+        rotationDegrees: op.rotationDegrees,
+        fovDegrees: op.fovDegrees,
+        rangeMeters: op.rangeMeters,
+        mountHeightM: op.mountHeightM ?? 2.7,
+        installStatus: "proposed",
+      });
+      return { idAssigned: id };
+    }
+    case "move-device": {
+      const d = floor.devices.find((x) => x.id === op.deviceId);
+      if (d) {
+        d.x = op.newX;
+        d.y = op.newY;
+      }
+      return {};
+    }
+    case "rotate-device": {
+      const d = floor.devices.find((x) => x.id === op.deviceId);
+      if (d) d.rotationDegrees = op.newRotationDegrees;
+      return {};
+    }
+    case "remove-device": {
+      floor.devices = floor.devices.filter((d) => d.id !== op.deviceId);
+      return {};
+    }
+    case "update-device": {
+      const d = floor.devices.find((x) => x.id === op.deviceId);
+      if (d) {
+        if (op.label !== undefined) d.label = op.label;
+        if (op.fovDegrees !== undefined) d.fovDegrees = op.fovDegrees;
+        if (op.rangeMeters !== undefined) d.rangeMeters = op.rangeMeters;
+        if (op.mountHeightM !== undefined) d.mountHeightM = op.mountHeightM;
+        if (op.installStatus !== undefined) d.installStatus = op.installStatus;
+      }
+      return {};
+    }
+    case "add-wall": {
+      const id = nextId("wall");
+      floor.walls.push({
+        id,
+        startX: op.startX,
+        startY: op.startY,
+        endX: op.endX,
+        endY: op.endY,
+      });
+      return { idAssigned: id };
+    }
+    case "remove-wall": {
+      floor.walls = floor.walls.filter((w) => w.id !== op.wallId);
+      return {};
+    }
+    case "add-door": {
+      // Snap (x,y) onto the chosen wall — mirrors the client's snapping
+      // logic in applyChatOperation so the door positions agree.
+      const wall = floor.walls.find((w) => w.id === op.wallId);
+      let snapX = op.x;
+      let snapY = op.y;
+      if (wall) {
+        const dx = wall.endX - wall.startX;
+        const dy = wall.endY - wall.startY;
+        const len2 = dx * dx + dy * dy;
+        if (len2 > 0) {
+          const t = Math.max(
+            0,
+            Math.min(
+              1,
+              ((op.x - wall.startX) * dx + (op.y - wall.startY) * dy) / len2,
+            ),
+          );
+          snapX = wall.startX + dx * t;
+          snapY = wall.startY + dy * t;
+        }
+      }
+      const id = nextId("door");
+      floor.doors.push({
+        id,
+        x: snapX,
+        y: snapY,
+        widthMeters: op.widthMeters,
+        locked: op.locked,
+        label: op.label,
+      });
+      return { idAssigned: id };
+    }
+    case "set-floor-scale": {
+      floor.scalePxPerMeter = op.scalePxPerMeter;
+      return {};
+    }
+    case "set-door-lock": {
+      const door = floor.doors.find((d) => d.id === op.doorId);
+      if (!door) return {};
+      if (op.clear) {
+        door.lock = undefined;
+        return {};
+      }
+      const base = door.lock ?? {
+        type: op.lockType ?? "mag-lock",
+        brand: "",
+        model: "",
+      };
+      door.lock = {
+        ...base,
+        ...(op.lockType !== undefined && { type: op.lockType }),
+        ...(op.brand !== undefined && { brand: op.brand }),
+        ...(op.model !== undefined && { model: op.model }),
+        ...(op.voltage !== undefined && { voltage: op.voltage }),
+        ...(op.currentDrawA !== undefined && { currentDrawA: op.currentDrawA }),
+        ...(op.failMode !== undefined && { failMode: op.failMode }),
+        ...(op.weatherRated !== undefined && { weatherRated: op.weatherRated }),
+        ...(op.compatibleWith !== undefined && { compatibleWith: op.compatibleWith }),
+        ...(op.notes !== undefined && { notes: op.notes }),
+      };
+      return {};
+    }
+    // Annotation, quote, and view ops don't affect spatial verification —
+    // they have no representation in the mirror.
+    default:
+      return {};
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   SERVER-EXECUTED TOOLS
+   ─────────────────────────────────────────────────────────────────────── */
+
+interface ServerToolBudgets {
+  runAdvisorUsed: number;
+  fetchUrlUsed: number;
+}
+
+/** Friendly status-pill label shown to the user while a server tool runs.
+ *  Inputs may be partial mid-stream, so we parse defensively. */
+function serverToolLabel(name: string, partialJson: string): string {
+  switch (name) {
+    case "analyze_coverage":
+      return "Analyzing coverage";
+    case "run_advisor":
+      return "Running coverage advisor";
+    case "fetch_url": {
+      try {
+        const input = JSON.parse(partialJson || "{}") as { url?: string };
+        if (typeof input.url === "string") {
+          const u = new URL(input.url);
+          return `Fetching ${u.hostname}`;
+        }
+      } catch {
+        /* mid-stream JSON is fine to fall through */
+      }
+      return "Fetching URL";
+    }
+    case "validate_placement":
+      return "Checking placement";
+    default:
+      return name;
+  }
+}
+
+async function executeServerTool(args: {
+  name: string;
+  input: Record<string, unknown>;
+  floor: FloorSnapshot;
+  designName: string;
+  buildingType?: string;
+  client: Anthropic;
+  budgets: ServerToolBudgets;
+}): Promise<string> {
+  switch (args.name) {
+    case "analyze_coverage":
+      return analyzeCoverageTool(args.input, args.floor);
+    case "run_advisor":
+      if (args.budgets.runAdvisorUsed >= RUN_ADVISOR_MAX) {
+        return `run_advisor budget exhausted (${RUN_ADVISOR_MAX} per conversation). Use the existing analyze_coverage output and your judgment.`;
+      }
+      args.budgets.runAdvisorUsed++;
+      return runAdvisorTool(args.floor, args.designName, args.buildingType, args.client);
+    case "fetch_url":
+      if (args.budgets.fetchUrlUsed >= FETCH_URL_MAX) {
+        return `fetch_url budget exhausted (${FETCH_URL_MAX} per conversation).`;
+      }
+      args.budgets.fetchUrlUsed++;
+      return fetchUrlTool(args.input);
+    case "validate_placement":
+      return validatePlacementTool(args.input, args.floor);
+    default:
+      return `Unknown server tool: ${args.name}`;
+  }
+}
+
+/** Per-camera wall-clipped FOV verdict the agent can iterate on. */
+function analyzeCoverageTool(
+  input: Record<string, unknown>,
+  floor: FloorSnapshot,
+): string {
+  const idFilter: Set<string> | null = Array.isArray(input.deviceIds)
+    ? new Set(input.deviceIds.filter((x): x is string => typeof x === "string"))
+    : null;
+  const cameras = floor.devices.filter(
+    (d) =>
+      d.type === "camera" &&
+      typeof d.fovDegrees === "number" &&
+      typeof d.rangeMeters === "number" &&
+      (!idFilter || idFilter.has(d.id)),
+  );
+  if (cameras.length === 0) {
+    return idFilter
+      ? "No cameras matched the supplied deviceIds filter."
+      : "No cameras on the floor to analyze.";
+  }
+  if (floor.walls.length === 0) {
+    return "No walls present — cameras are unobstructed by definition. (Nominal FOV = actual.)";
+  }
+  const wallSegs = floor.walls.map((w) => ({
+    start: { x: w.startX, y: w.startY },
+    end: { x: w.endX, y: w.endY },
+  }));
+  const lines: string[] = [
+    `Wall-clipped coverage for ${cameras.length} camera(s):`,
+  ];
+  for (const cam of cameras) {
+    const fov = cam.fovDegrees!;
+    const rangeM = cam.rangeMeters!;
+    const polygon = clippedFovPolygon({
+      origin: { x: cam.x, y: cam.y },
+      rotation: (cam.rotationDegrees * Math.PI) / 180,
+      fovDegrees: fov,
+      rangeMeters: rangeM,
+      scalePxPerMeter: floor.scalePxPerMeter,
+      walls: wallSegs,
+      segments: 24,
+    });
+    const actualSqPx = polygonArea(polygon);
+    const actualSqM =
+      actualSqPx / (floor.scalePxPerMeter * floor.scalePxPerMeter);
+    const nominalSqM = Math.PI * rangeM * rangeM * (fov / 360);
+    const pct = nominalSqM > 0 ? Math.round((actualSqM / nominalSqM) * 100) : 0;
+    const verdict =
+      pct >= 90
+        ? "minimal occlusion"
+        : pct >= 65
+          ? "meaningful occlusion"
+          : pct >= 40
+            ? "HEAVY OCCLUSION — rotate or move"
+            : "MOSTLY BLOCKED — relocate this camera";
+    lines.push(
+      `  [${cam.id}] "${cam.label}" @ (${cam.x.toFixed(0)},${cam.y.toFixed(0)}) rot ${cam.rotationDegrees.toFixed(0)}° — actual ${actualSqM.toFixed(1)} m² of nominal ${nominalSqM.toFixed(1)} m² (${pct}%) — ${verdict}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Run the full AI advisor against the current floor and return its
+ *  findings as a structured text block the agent can act on. */
+async function runAdvisorTool(
+  floor: FloorSnapshot,
+  designName: string,
+  buildingType: string | undefined,
+  client: Anthropic,
+): Promise<string> {
+  const body: AdvisorRequestBody = {
+    designName,
+    buildingType,
+    floor: {
+      name: floor.name,
+      scalePxPerMeter: floor.scalePxPerMeter,
+      ceilingHeightM: floor.ceilingHeightM,
+      walls: floor.walls.map((w) => ({
+        startX: w.startX,
+        startY: w.startY,
+        endX: w.endX,
+        endY: w.endY,
+      })),
+      devices: floor.devices.map((d) => ({
+        id: d.id,
+        type: d.type,
+        subtype: d.subtype,
+        label: d.label,
+        x: d.x,
+        y: d.y,
+        rotationDegrees: d.rotationDegrees,
+        fovDegrees: d.fovDegrees,
+        rangeMeters: d.rangeMeters,
+        mountHeightM: d.mountHeightM,
+        installStatus: d.installStatus,
+      })),
+    },
+  };
+  const result = await runAdvisorAgent(client, body);
+  const lines: string[] = [
+    `Advisor summary: ${result.summary || "(no summary returned)"}`,
+    `Findings (${result.findings.length}):`,
+  ];
+  for (const f of result.findings) {
+    lines.push(
+      `  [${f.id}] ${f.severity.toUpperCase()} · ${f.kind} — ${f.title}`,
+    );
+    lines.push(`    ${f.description}`);
+    if (f.location) {
+      lines.push(
+        `    Location: (${f.location.x.toFixed(0)}, ${f.location.y.toFixed(0)})`,
+      );
+    }
+    const a = f.suggestedAction;
+    let actionLine = "    Recommended: ";
+    if (a.kind === "add-device") {
+      actionLine += `add ${a.deviceType}${a.subtype ? ` (${a.subtype})` : ""} "${a.label}" at (${a.x.toFixed(0)}, ${a.y.toFixed(0)}) rot ${a.rotationDegrees.toFixed(0)}° — ${a.rationale}`;
+    } else if (a.kind === "remove-device") {
+      actionLine += `remove device ${a.deviceId} — ${a.rationale}`;
+    } else if (a.kind === "rotate-device") {
+      actionLine += `rotate ${a.deviceId} to ${a.newRotationDegrees.toFixed(0)}° — ${a.rationale}`;
+    } else if (a.kind === "move-device") {
+      actionLine += `move ${a.deviceId} to (${a.newX.toFixed(0)}, ${a.newY.toFixed(0)}) — ${a.rationale}`;
+    } else {
+      actionLine += `manual review — ${a.rationale}`;
+    }
+    lines.push(actionLine);
+  }
+  return lines.join("\n");
+}
+
+/** GET a public HTTPS URL and return scrubbed text. Blocks private IPs,
+ *  caps response size, enforces a 10s timeout. */
+async function fetchUrlTool(input: Record<string, unknown>): Promise<string> {
+  const raw = typeof input.url === "string" ? input.url.trim() : "";
+  if (!raw) return "Error: missing 'url' parameter.";
+  if (!raw.toLowerCase().startsWith("https://")) {
+    return "Error: only https:// URLs are supported.";
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "Error: invalid URL.";
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (isPrivateHost(host)) {
+    return "Error: private / local URLs are blocked for safety.";
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(raw, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "DeeperVisionAgent/1.0 (+https://deeper-vision-self.vercel.app)",
+        accept: "text/html,text/plain,application/xhtml+xml,*/*;q=0.5",
+      },
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      return `Error: ${parsed.hostname} returned HTTP ${res.status}.`;
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    // Pull at most ~500 KB of bytes, then strip HTML and truncate text.
+    const buf = await res.arrayBuffer();
+    const slice = buf.byteLength > 500_000 ? buf.slice(0, 500_000) : buf;
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const raw_text = decoder.decode(slice);
+    let stripped = raw_text;
+    if (contentType.includes("html") || /<html[\s>]/i.test(raw_text)) {
+      stripped = raw_text
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+    }
+    stripped = stripped.replace(/\s+/g, " ").trim();
+    if (!stripped) return "Page fetched OK but contained no readable text.";
+    const MAX = 50_000;
+    return stripped.length > MAX
+      ? stripped.slice(0, MAX) + `\n…[truncated, ${stripped.length - MAX} more chars]`
+      : stripped;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return "Error: fetch timed out after 10s.";
+    }
+    return `Error fetching URL: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Spatial sanity check on one or more devices using the live server-floor
+ * mirror — so a camera the agent placed earlier in this same turn shows
+ * up here and can be self-corrected. Returns concrete numbers + verdict
+ * lines the agent can act on (rotate, move, remove).
+ */
+function validatePlacementTool(
+  input: Record<string, unknown>,
+  floor: FloorSnapshot,
+): string {
+  // Build the id filter (single deviceId OR deviceIds array OR none-means-all).
+  let ids: Set<string> | null = null;
+  if (typeof input.deviceId === "string" && input.deviceId.trim()) {
+    ids = new Set([input.deviceId.trim()]);
+  } else if (Array.isArray(input.deviceIds)) {
+    ids = new Set(
+      input.deviceIds.filter((x): x is string => typeof x === "string"),
+    );
+  }
+  const devices = floor.devices.filter((d) => !ids || ids.has(d.id));
+  if (devices.length === 0) {
+    return ids
+      ? "No devices matched the id filter (was it added in a prior turn?)."
+      : "No devices on the floor to validate.";
+  }
+  const lines: string[] = [
+    `Placement check for ${devices.length} device(s) (scale: ${floor.scalePxPerMeter} px/m):`,
+  ];
+  for (const d of devices) {
+    lines.push(
+      `[${d.id}] ${d.type}${d.subtype ? ` (${d.subtype})` : ""} "${d.label}" @ (${d.x.toFixed(0)}, ${d.y.toFixed(0)}):`,
+    );
+    for (const line of validateOneDevice(d, floor)) lines.push(`  ${line}`);
+  }
+  return lines.join("\n");
+}
+
+function validateOneDevice(
+  d: FloorSnapshot["devices"][number],
+  floor: FloorSnapshot,
+): string[] {
+  const out: string[] = [];
+  const scale = floor.scalePxPerMeter;
+
+  // ── Distance to nearest wall ──────────────────────────────────────────
+  let nearestWallDistPx = Infinity;
+  let nearestWallId = "";
+  for (const w of floor.walls) {
+    const r = pointToSegment(d.x, d.y, w.startX, w.startY, w.endX, w.endY);
+    if (r.dist < nearestWallDistPx) {
+      nearestWallDistPx = r.dist;
+      nearestWallId = w.id;
+    }
+  }
+  if (!Number.isFinite(nearestWallDistPx)) {
+    out.push("• No walls on the floor — can't reason about wall mount.");
+  } else {
+    const wallM = nearestWallDistPx / scale;
+    if (wallM < 0.3) {
+      out.push(
+        `• Wall-mounted: ${wallM.toFixed(2)} m from ${nearestWallId} — OK.`,
+      );
+    } else if (wallM < 1.2) {
+      out.push(
+        `• ${wallM.toFixed(2)} m from nearest wall (${nearestWallId}) — close to a wall but not mounted.`,
+      );
+    } else if (d.type === "sensor" && d.subtype === "motion") {
+      // Motion sensors are ceiling-mounted in room centers — far-from-wall is good.
+      out.push(
+        `• ${wallM.toFixed(2)} m from nearest wall — appropriate for a ceiling-mounted motion sensor.`,
+      );
+    } else {
+      out.push(
+        `• ${wallM.toFixed(2)} m from nearest wall (${nearestWallId}) — free-standing / ceiling-mounted.`,
+      );
+    }
+  }
+
+  // ── Camera-specific: FOV-into-wall + redundancy ───────────────────────
+  if (
+    d.type === "camera" &&
+    typeof d.fovDegrees === "number" &&
+    typeof d.rangeMeters === "number"
+  ) {
+    const samples = 9;
+    const halfFov = ((d.fovDegrees / 2) * Math.PI) / 180;
+    const rot = (d.rotationDegrees * Math.PI) / 180;
+    let nearBlocked = 0;
+    for (let i = 0; i < samples; i++) {
+      const t = i / (samples - 1);
+      const a = rot - halfFov + t * 2 * halfFov;
+      const dir = { x: Math.cos(a), y: Math.sin(a) };
+      let nearest = Infinity;
+      for (const w of floor.walls) {
+        const hit = rayHitSegment(
+          { x: d.x, y: d.y },
+          dir,
+          { x: w.startX, y: w.startY },
+          { x: w.endX, y: w.endY },
+        );
+        if (hit != null && hit < nearest) nearest = hit;
+      }
+      if (Number.isFinite(nearest) && nearest / scale < 0.5) nearBlocked++;
+    }
+    const blockPct = Math.round((nearBlocked / samples) * 100);
+    if (blockPct >= 67) {
+      out.push(
+        `• FOV BLOCKED: ${blockPct}% of FOV rays hit a wall within 0.5 m — camera is facing into a wall. Rotate or move.`,
+      );
+    } else if (blockPct >= 34) {
+      out.push(
+        `• FOV partially blocked: ${blockPct}% of FOV rays hit a wall <0.5 m away — consider rotating.`,
+      );
+    } else {
+      out.push(
+        `• FOV facing: ${blockPct}% blocked by very-close walls — OK.`,
+      );
+    }
+
+    // Camera redundancy — nearest other camera + crude position-overlap warning.
+    let nearestOtherPx = Infinity;
+    let nearestOtherId = "";
+    for (const other of floor.devices) {
+      if (other.id === d.id || other.type !== "camera") continue;
+      const dist = Math.hypot(other.x - d.x, other.y - d.y);
+      if (dist < nearestOtherPx) {
+        nearestOtherPx = dist;
+        nearestOtherId = other.id;
+      }
+    }
+    if (Number.isFinite(nearestOtherPx)) {
+      const otherM = nearestOtherPx / scale;
+      if (otherM < 3) {
+        out.push(
+          `• Redundancy: nearest camera ${nearestOtherId} at ${otherM.toFixed(1)} m — likely overlapping coverage; consider removing one.`,
+        );
+      } else {
+        out.push(
+          `• Nearest other camera ${nearestOtherId} at ${otherM.toFixed(1)} m — OK.`,
+        );
+      }
+    } else {
+      out.push("• Only camera on the floor.");
+    }
+  }
+
+  // ── Reader: distance to nearest door ──────────────────────────────────
+  if (d.type === "reader") {
+    let nearestDoorPx = Infinity;
+    let nearestDoorId = "";
+    for (const door of floor.doors) {
+      const dist = Math.hypot(door.x - d.x, door.y - d.y);
+      if (dist < nearestDoorPx) {
+        nearestDoorPx = dist;
+        nearestDoorId = door.id;
+      }
+    }
+    if (!Number.isFinite(nearestDoorPx)) {
+      out.push(
+        "• PROBLEM: no doors on the floor — reader has nothing to control.",
+      );
+    } else {
+      const doorM = nearestDoorPx / scale;
+      if (doorM < 1.5) {
+        out.push(
+          `• ${doorM.toFixed(2)} m from door ${nearestDoorId} — OK (readers mount within ~1 m of the door).`,
+        );
+      } else if (doorM < 4) {
+        out.push(
+          `• ${doorM.toFixed(2)} m from nearest door (${nearestDoorId}) — typical is <1.5 m. Consider moving closer.`,
+        );
+      } else {
+        out.push(
+          `• PROBLEM: ${doorM.toFixed(1)} m from nearest door (${nearestDoorId}) — readers usually mount within 1.5 m of the door they control. Move or link explicitly.`,
+        );
+      }
+    }
+  }
+
+  // ── Door-contact sensor: must sit on the door ─────────────────────────
+  if (d.type === "sensor" && d.subtype === "door-contact") {
+    let nearestDoorPx = Infinity;
+    let nearestDoorId = "";
+    for (const door of floor.doors) {
+      const dist = Math.hypot(door.x - d.x, door.y - d.y);
+      if (dist < nearestDoorPx) {
+        nearestDoorPx = dist;
+        nearestDoorId = door.id;
+      }
+    }
+    if (!Number.isFinite(nearestDoorPx)) {
+      out.push("• PROBLEM: no door to attach to — door-contact needs a door.");
+    } else {
+      const doorM = nearestDoorPx / scale;
+      if (doorM < 0.5) {
+        out.push(
+          `• ON door ${nearestDoorId} (${doorM.toFixed(2)} m) — OK.`,
+        );
+      } else {
+        out.push(
+          `• PROBLEM: ${doorM.toFixed(2)} m from nearest door (${nearestDoorId}) — door-contact sensors must sit ON the door (<0.5 m). Move it.`,
+        );
+      }
+    }
+  }
+
+  return out;
+}
+
+/** Block private RFC-1918 / loopback / link-local hosts so fetch_url
+ *  can't be used to probe internal infrastructure. */
+function isPrivateHost(host: string): boolean {
+  if (
+    host === "localhost" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  )
+    return true;
+  if (/^127\./.test(host)) return true;
+  if (/^10\./.test(host)) return true;
+  if (/^192\.168\./.test(host)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(host)) return true;
+  if (/^169\.254\./.test(host)) return true;
+  // Bare IPv6 — block everything in fc00::/7 (unique local) and fe80::/10 (link-local).
+  if (/^fc[0-9a-f]{2}:/i.test(host)) return true;
+  if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
+  return false;
 }

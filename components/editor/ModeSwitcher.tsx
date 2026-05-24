@@ -5,8 +5,8 @@ import { useDesignStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
 const modes = [
-  { value: "2d" as const, label: "2D", icon: MousePointer2 },
   { value: "3d" as const, label: "3D", icon: Eye },
+  { value: "2d" as const, label: "2D", icon: MousePointer2 },
   { value: "sim" as const, label: "Sim", icon: Play },
 ];
 
@@ -22,7 +22,10 @@ export function ModeSwitcher() {
   const activeIndex = modes.findIndex((m) => m.value === mode);
 
   return (
-    <div className="relative inline-flex items-center rounded-full bg-foreground/[0.04] p-0.5 ring-1 ring-black/[0.04] dark:ring-white/[0.05]">
+    <div
+      data-tour="mode-switcher"
+      className="relative inline-flex items-center rounded-full bg-foreground/[0.04] p-0.5 ring-1 ring-black/[0.04] dark:ring-white/[0.05]"
+    >
       {/* Sliding pill — sits behind the active button */}
       <div
         className="absolute top-0.5 bottom-0.5 rounded-full bg-card shadow-[0_1px_2px_-1px_rgba(0,0,0,0.18),inset_0_1px_0_oklch(1_0_0/12%)] ring-1 ring-black/[0.04] dark:ring-white/[0.06] transition-transform duration-[280ms] ease-[cubic-bezier(0.22,0.68,0.35,1)]"
